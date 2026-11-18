@@ -14,6 +14,8 @@ TOP_N = 100
 MAX_PER_RUN = 3
 DAILY_CAP = 15
 COOLDOWN_H = 6
+MIN_VOL_RATIO = 1.2      # 15m volume, 20-candle average-ஐ விட எத்தனை மடங்கு இருக்கணும்
+SHOW_SKIPPED = True      # AI "SKIP" சொன்ன setup-களையும் Telegram-ல் காட்டு (True / False)
 LOG = "signals_log.csv"
 FIELDS = ["time", "symbol", "side", "entry", "sl", "tp", "status"]
 FMT = "%Y-%m-%d %H:%M"
@@ -22,11 +24,13 @@ STABLE = {"USDC", "FDUSD", "TUSD", "USDP", "EUR", "DAI", "AEUR", "USD1", "XUSD",
 
 def tg(text):
     try:
-        requests.post(
+        r = requests.post(
             "https://api.telegram.org/bot" + TG_TOKEN + "/sendMessage",
             data={"chat_id": CHAT_ID, "text": text},
             timeout=20,
         )
+        if r.status_code != 200:
+            print("telegram error", r.status_code, r.text[:200])
     except Exception as e:
         print("telegram error", type(e).__name__)
 
@@ -128,14 +132,15 @@ def trend(df):
     return "FLAT"
 
 
-def analyze(symbol, now):
+def analyze(symbol, now, stats):
+    # படி 1: 1 hour கேண்டில் - trend (மேலே / கீழே)
     h1 = add_ind(klines(symbol, "1h"))
     t1 = trend(h1)
     if t1 == "FLAT":
         return None
-    h4 = add_ind(klines(symbol, "4h"))
-    if trend(h4) != t1:
-        return None
+    stats["trend"] += 1
+
+    # படி 2: 15 minutes கேண்டில் - entry
     m = add_ind(klines(symbol, "15m"))
     a = m.iloc[-2]
     b = m.iloc[-1]
@@ -148,8 +153,13 @@ def analyze(symbol, now):
         side = "LONG"
     if t1 == "DOWN" and a["c"] >= a["ema20"] and b["c"] < b["ema20"] and 32 <= rsi1 <= 60:
         side = "SHORT"
-    if side is None or vol_ratio < 1.2:
+    if side is None:
         return None
+    stats["cross"] += 1
+    if vol_ratio < MIN_VOL_RATIO:
+        return None
+    stats["setup"] += 1
+
     atr = h1.iloc[-1]["atr"]
     entry = b["c"]
     if side == "LONG":
@@ -169,7 +179,8 @@ def ask_claude(c):
     prompt = (
         "You are a cautious crypto futures analyst reviewing an auto-detected setup. "
         "Coin " + c["symbol"] + ", side " + c["side"] + ". "
-        "4h and 1h trend: " + c["trend"] + ". 1h RSI " + str(round(c["rsi1"])) + ". "
+        "1h trend: " + c["trend"] + ". 1h RSI " + str(round(c["rsi1"])) + ". "
+        "15m candle just closed across its EMA20 in the trend direction. "
         "15m volume is " + str(round(c["vol_ratio"], 1)) + "x its 20-candle average. "
         "Entry " + fmt(c["entry"]) + ", stop " + fmt(c["sl"]) + ", target " + fmt(c["tp"]) + " (risk:reward 1:2). "
         "Reply in exactly two lines. Line 1: TAKE or SKIP. "
@@ -190,7 +201,7 @@ def ask_claude(c):
         r = requests.post("https://api.anthropic.com/v1/messages", headers=headers, json=body, timeout=60)
         j = r.json()
         if "content" not in j:
-            print("claude error", r.status_code)
+            print("claude error", r.status_code, str(j)[:300])
             return None, ""
         lines = j["content"][0]["text"].strip().splitlines()
         verdict = "TAKE" if "TAKE" in lines[0].upper() else "SKIP"
@@ -247,22 +258,35 @@ def check_open(rows, now):
             tg(icon + "\n" + r["symbol"] + " " + r["side"] + "\nமொத்தம்: ✅ " + str(wins) + " | ❌ " + str(losses))
 
 
+def signal_text(c, header, reason, footer):
+    return (
+        header + "\n"
+        "Entry: " + fmt(c["entry"]) + "\n"
+        "Stop-loss: " + fmt(c["sl"]) + "\n"
+        "Target: " + fmt(c["tp"]) + "\n"
+        "Leverage: 3x-க்கு மேல் வேண்டாம், Isolated margin\n\n"
+        + (reason + "\n\n" if reason else "") + footer
+    )
+
+
 def main():
     now = datetime.now(timezone.utc)
     first_run = not os.path.exists(LOG)
     rows = read_log()
     if first_run:
-        tg("✅ Scanner தொடங்கியது. Setup உருவானால் மட்டும் மெசேஜ் வரும்.")
+        tg("✅ Scanner தொடங்கியது (1h trend + 15m entry). Setup உருவானால் மட்டும் மெசேஜ் வரும்.")
     check_open(rows, now)
 
     syms = list(dict.fromkeys(favorites() + top_symbols()))
-    print("coins:", len(syms))
+    stats = {"trend": 0, "cross": 0, "setup": 0}
+    errors = 0
     cands = []
     for s in syms:
         try:
-            res = analyze(s, now)
+            res = analyze(s, now, stats)
         except Exception as e:
             print(s, "error", type(e).__name__)
+            errors += 1
             continue
         time.sleep(0.05)
         if res is None:
@@ -273,6 +297,8 @@ def main():
 
     cands.sort(key=lambda x: x["vol_ratio"], reverse=True)
     sent = 0
+    skipped = 0
+    claude_fail = 0
     for c in cands:
         if sent >= MAX_PER_RUN:
             break
@@ -284,22 +310,36 @@ def main():
         if recent:
             continue
         verdict, reason = ask_claude(c)
-        if verdict is None:
-            continue
         row = {"time": c["time"], "symbol": c["symbol"], "side": c["side"],
                "entry": str(c["entry"]), "sl": str(c["sl"]), "tp": str(c["tp"]), "status": "SKIP"}
-        if verdict == "TAKE":
+        if verdict is None:
+            # AI வேலை செய்யலைனாலும் signal-ஐ விடாமல் அனுப்பு
+            claude_fail += 1
             row["status"] = "OPEN"
             sent += 1
-            tg(
-                "📊 " + c["symbol"] + " — " + c["side"] + "\n"
-                "Entry: " + fmt(c["entry"]) + "\n"
-                "Stop-loss: " + fmt(c["sl"]) + "\n"
-                "Target: " + fmt(c["tp"]) + "\n"
-                "Leverage: 3x-க்கு மேல் வேண்டாம், Isolated margin\n\n"
-                + reason + "\n\n⚠️ உத்தரவாதம் இல்லை. Stop-loss கட்டாயம்."
-            )
+            tg(signal_text(c, "📊 " + c["symbol"] + " — " + c["side"],
+                           "(AI review கிடைக்கவில்லை)", "⚠️ உத்தரவாதம் இல்லை. Stop-loss கட்டாயம்."))
+        elif verdict == "TAKE":
+            row["status"] = "OPEN"
+            sent += 1
+            tg(signal_text(c, "📊 " + c["symbol"] + " — " + c["side"],
+                           reason, "⚠️ உத்தரவாதம் இல்லை. Stop-loss கட்டாயம்."))
+        else:
+            skipped += 1
+            if SHOW_SKIPPED:
+                tg(signal_text(c, "👀 " + c["symbol"] + " — " + c["side"] + " (AI: SKIP)",
+                               reason, "ℹ️ தகவலுக்கு மட்டும். Trade எடுக்க வேண்டாம்."))
         rows.append(row)
+
+    if claude_fail:
+        tg("⚠️ Claude API வேலை செய்யவில்லை (" + str(claude_fail) + " முறை). "
+           "CLAUDE_KEY சரியா, Anthropic account-ல் credit இருக்கா என்று பாருங்கள்.")
+
+    print("coins:", len(syms), "| errors:", errors)
+    print("1h trend உள்ளவை:", stats["trend"], "| 15m cross:", stats["cross"],
+          "| volume-உம் சரி (setup):", stats["setup"])
+    print("புதிய candidates:", len(cands), "| அனுப்பியது:", sent,
+          "| AI SKIP:", skipped, "| AI error:", claude_fail)
 
     rows = [x for x in rows if not (x["status"] == "SKIP" and now - tparse(x["time"]) > timedelta(days=2))]
     write_log(rows)
