@@ -22,7 +22,7 @@ jobs:
         env:
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
-          CLAUDE_KEY: ${{ secrets.CLAUDE_KEY }}
+          CLAUDE_KEY: ${{ secrets.CLAUD_KEY }}
       - name: Save log
         run: |
           git config user.name "bot"
