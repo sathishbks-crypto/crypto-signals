@@ -1,0 +1,57 @@
+name: Signal Scanner
+
+on:
+  schedule:
+    # 2 minutes after every 15-minute candle closes (times are UTC)
+    - cron: "2,17,32,47 * * * *"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "scan = normal | backtest = test rules on past data | test = send a test message"
+        required: true
+        default: "scan"
+        type: choice
+        options:
+          - scan
+          - backtest
+          - test
+
+concurrency:
+  group: signal-scanner
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Get code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Load memory of sent signals
+        uses: actions/cache/restore@v4
+        with:
+          path: state.json
+          key: scanner-state-${{ github.run_id }}
+          restore-keys: |
+            scanner-state-
+
+      - name: Run scanner
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN || secrets.TELEGRAM_TOKEN || secrets.BOT_TOKEN || secrets.TG_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID || secrets.CHAT_ID || secrets.TG_CHAT_ID }}
+          MODE: ${{ github.event.inputs.mode || 'scan' }}
+        run: python scanner.py "$MODE"
+
+      - name: Save memory of sent signals
+        if: always()
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: state.json
+          key: scanner-state-${{ github.run_id }}
