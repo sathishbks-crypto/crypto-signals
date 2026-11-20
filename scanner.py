@@ -23,6 +23,7 @@ Only the Python standard library is used.
 """
 
 import bisect
+import csv
 import json
 import os
 import sys
@@ -46,6 +47,12 @@ BACKTEST_DAYS = 30
 BACKTEST_MAX_BARS = 48            # close a test trade after 12h
 FEE_PCT_ROUND_TRIP = 0.10
 MIN_TRADES_TO_TRUST = 20          # rule set needs at least this many test trades
+LOG_FILE = "live_signals.csv"     # every live signal + its real result
+
+
+def rp(x):
+    """Result as % of the amount risked: 1.4 -> +140%, -1 -> -100%."""
+    return f"{x * 100:+.0f}%"
 BACKTEST_MAX_AGE_HOURS = 30       # live scan re-tests if the last test is older
 
 # Rule sets that are tested. Live uses the best one that is profitable.
@@ -130,12 +137,26 @@ class Market:
             self.mode, self.host = "spot", SPOT_HOST
         print(f"[data] using {self.mode} data from {self.host}")
 
-    def _raw(self, symbol, interval, limit, end_time=None):
+    def _raw(self, symbol, interval, limit, end_time=None, start_time=None):
         path = "/fapi/v1/klines" if self.mode == "futures" else "/api/v3/klines"
         p = {"symbol": symbol, "interval": interval, "limit": limit}
         if end_time:
             p["endTime"] = end_time
+        if start_time:
+            p["startTime"] = start_time
         return http_get(self.host + path, p)
+
+    def klines_from(self, symbol, interval, start_ms, limit=100):
+        """Closed candles starting at start_ms (used to check live signals)."""
+        now_ms = int(time.time() * 1000)
+        rows = [r for r in self._raw(symbol, interval, limit, start_time=start_ms)
+                if int(r[6]) < now_ms]
+        return {
+            "t": [int(r[0]) for r in rows], "tc": [int(r[6]) for r in rows],
+            "o": [float(r[1]) for r in rows], "h": [float(r[2]) for r in rows],
+            "l": [float(r[3]) for r in rows], "c": [float(r[4]) for r in rows],
+            "v": [float(r[7]) for r in rows],
+        }
 
     def klines(self, symbol, interval, total):
         """Fetch `total` candles (pages backwards if needed). Closed candles only."""
@@ -554,6 +575,7 @@ def format_signal(s, group, data_mode, active):
     lines += [
         "",
         "<b>Plan:</b> At Target 1 book half and move stop-loss to entry. "
+        "If nothing is hit within 12 hours, close the trade. "
         "Skip if price already moved more than 0.5% from entry.",
         "",
         f"Rule set: {P['name']} — last {BACKTEST_DAYS} days test: "
@@ -646,7 +668,7 @@ def simulate(m15, i, sig):
             return "tp2", 0.5 * r1 + 0.5 * r2 - fee_r, k
     rm = d * (m15["c"][end] - e) / risk
     if hit1:
-        return "tp1", 0.5 * r1 + 0.5 * max(rm, 0) - fee_r, end
+        return "tp1_end", 0.5 * r1 + 0.5 * max(rm, 0) - fee_r, end
     return "timeout", rm - fee_r, end
 
 
@@ -697,7 +719,7 @@ def stats(trades, start_ms):
     second = [t for t in trades if t[4] >= mid]
 
     def win(ts):
-        return sum(1 for t in ts if t[2] in ("tp1", "tp2")) / len(ts) * 100 if ts else 0.0
+        return sum(1 for t in ts if t[2] in ("tp1", "tp1_end", "tp2")) / len(ts) * 100 if ts else 0.0
 
     return {
         "n": n, "win": win(trades),
@@ -735,14 +757,15 @@ def backtest_and_choose(state, announce):
     for k, s in results.items():
         mark = "✅" if k == best else ("➖" if s["net"] > 0 else "❌")
         lines.append(f"{mark} {k} {VARIANTS[k]['name']}: {s['n']} trades, win {s['win']:.0f}%, "
-                     f"net {s['net']:+.1f}R (halves {s['net1']:+.1f} / {s['net2']:+.1f})")
+                     f"total {rp(s['net'])} (halves {rp(s['net1'])} / {rp(s['net2'])})")
     lines.append("")
     if best:
         lines.append(f"✅ <b>Live signals now use rule set {best}: {VARIANTS[best]['name']}</b>")
     else:
         lines.append("⏸ <b>Live signals PAUSED</b> — no rule set made a profit in both halves of "
                      "the test period. The test repeats daily and signals restart automatically.")
-    lines.append("R = amount risked per trade, fees included. Past results do not guarantee "
+    lines.append("% = profit/loss compared to the amount risked per trade (100% = one full stop-loss). "
+                 "Fees included. Past results do not guarantee "
                  "future results.")
     msg = "\n".join(lines)
     print(msg.replace("<b>", "").replace("</b>", ""))
@@ -752,23 +775,203 @@ def backtest_and_choose(state, announce):
 
 
 # ----------------------------------------------------------------------------
+# Live signal log + result tracking + monthly report
+# ----------------------------------------------------------------------------
+LOG_FIELDS = ["id", "time_ist", "symbol", "side", "entry", "sl", "tp1", "tp2",
+              "tp1_r", "tp2_r", "risk", "rule", "group", "candle_ms",
+              "status", "result", "r_multiple", "closed_ist"]
+RESULT_TEXT = {
+    "tp2": "TARGET 2 HIT",
+    "tp1": "TARGET 1 HIT (rest closed at entry)",
+    "loss": "STOP-LOSS HIT",
+    "timeout": "CLOSED AFTER 12H",
+}
+
+
+def read_log():
+    if not os.path.exists(LOG_FILE):
+        return []
+    try:
+        with open(LOG_FILE, newline="", encoding="utf-8") as f:
+            return list(csv.DictReader(f))
+    except Exception as e:
+        print("[log] could not read log:", e)
+        return []
+
+
+def write_log(rows):
+    with open(LOG_FILE, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=LOG_FIELDS, extrasaction="ignore")
+        w.writeheader()
+        for r in rows:
+            w.writerow(r)
+
+
+def log_signal(sig, group, rule_key):
+    rows = read_log()
+    now = datetime.now(IST)
+    rows.append({
+        "id": f"{sig['symbol']}-{sig['candle_time']}",
+        "time_ist": now.strftime("%Y-%m-%d %H:%M"),
+        "symbol": sig["symbol"], "side": sig["side"],
+        "entry": f"{sig['entry']:.10g}", "sl": f"{sig['sl']:.10g}",
+        "tp1": f"{sig['tp1']:.10g}", "tp2": f"{sig['tp2']:.10g}",
+        "tp1_r": sig["tp1_r"], "tp2_r": sig["tp2_r"], "risk": f"{sig['risk']:.10g}",
+        "rule": rule_key, "group": group, "candle_ms": sig["candle_time"],
+        "status": "OPEN", "result": "", "r_multiple": "", "closed_ist": "",
+    })
+    write_log(rows)
+
+
+def update_open_signals(mkt):
+    """Check every OPEN signal against real prices after it was sent."""
+    rows = read_log()
+    changed = False
+    for r in rows:
+        if r.get("status") != "OPEN":
+            continue
+        try:
+            sig = {
+                "d": 1 if r["side"] == "LONG" else -1,
+                "entry": float(r["entry"]), "sl": float(r["sl"]),
+                "tp1": float(r["tp1"]), "tp2": float(r["tp2"]),
+                "tp1_r": float(r["tp1_r"]), "tp2_r": float(r["tp2_r"]),
+                "risk": float(r["risk"]),
+            }
+            k = mkt.klines_from(r["symbol"], "15m", int(r["candle_ms"]), BACKTEST_MAX_BARS + 5)
+        except Exception as e:
+            print(f"[track] {r.get('symbol')}: {e}")
+            continue
+        if len(k["c"]) < 2:
+            continue
+        res, rr, exit_i = simulate(k, 0, sig)
+        finished_window = len(k["c"]) - 1 >= BACKTEST_MAX_BARS
+        if res == "open":
+            continue
+        if res == "timeout" and not finished_window:
+            continue                                  # 12h not over yet
+        if res == "tp1_end" and not finished_window:
+            continue                                  # Target 1 hit, rest still running
+        if res == "tp1_end":
+            res = "tp1"
+        r["status"] = "CLOSED"
+        r["result"] = RESULT_TEXT.get(res, res)
+        r["r_multiple"] = f"{rr:.2f}"
+        r["closed_ist"] = datetime.fromtimestamp(k["tc"][exit_i] / 1000, IST).strftime("%Y-%m-%d %H:%M")
+        changed = True
+        emoji = "✅" if rr > 0 else "❌"
+        telegram_send(f"{emoji} <b>Result: {r['side']} {r['symbol']}</b> (signal {r['time_ist']} IST)\n"
+                      f"{r['result']} → <b>{rp(rr)}</b> of the amount risked")
+        time.sleep(0.05)
+    if changed:
+        write_log(rows)
+
+
+def month_report(year, month, title=None):
+    rows = [r for r in read_log() if r.get("time_ist", "").startswith(f"{year:04d}-{month:02d}")]
+    name = datetime(year, month, 1).strftime("%B %Y")
+    head = title or f"📅 <b>Monthly report — {name}</b>"
+    if not rows:
+        return f"{head}\nNo signals were sent in this month."
+    closed = [r for r in rows if r["status"] == "CLOSED"]
+    open_ = [r for r in rows if r["status"] != "CLOSED"]
+    rv = [float(r["r_multiple"] or 0) for r in closed]
+    wins = [r for r in closed if float(r["r_multiple"] or 0) > 0]
+    losses = [r for r in closed if float(r["r_multiple"] or 0) <= 0]
+    t2 = sum(1 for r in closed if r["result"].startswith("TARGET 2"))
+    t1 = sum(1 for r in closed if r["result"].startswith("TARGET 1"))
+    sl = sum(1 for r in closed if r["result"].startswith("STOP"))
+    to = sum(1 for r in closed if r["result"].startswith("CLOSED AFTER"))
+    net = sum(rv)
+    win_pct = len(wins) / len(closed) * 100 if closed else 0
+
+    per = {}
+    for r in closed:
+        per.setdefault(r["symbol"], 0.0)
+        per[r["symbol"]] += float(r["r_multiple"] or 0)
+    best = sorted(per.items(), key=lambda x: x[1], reverse=True)
+
+    def side_line(side):
+        ss = [r for r in closed if r["side"] == side]
+        if not ss:
+            return f"{side}: 0"
+        w = sum(1 for r in ss if float(r["r_multiple"] or 0) > 0)
+        return f"{side}: {len(ss)} trades, {w} won ({w / len(ss) * 100:.0f}%)"
+
+    lines = [
+        head, "",
+        f"Total signals: <b>{len(rows)}</b>  (finished {len(closed)}, still open {len(open_)})",
+        f"✅ Won: <b>{len(wins)}</b>   ❌ Lost: <b>{len(losses)}</b>   Win rate: <b>{win_pct:.0f}%</b>",
+        "",
+        f"Target 2 hit: {t2}",
+        f"Target 1 hit (rest at entry): {t1}",
+        f"Stop-loss hit: {sl}",
+        f"Closed after 12h: {to}",
+        "",
+        side_line("LONG") + "\n" + side_line("SHORT"),
+        "",
+        f"Total result: <b>{rp(net)}</b> of the amount risked per trade",
+        "(100% = one full stop-loss amount)",
+    ]
+    if best:
+        lines.append(f"Best coin: {best[0][0]} ({rp(best[0][1])})   "
+                     f"Worst coin: {best[-1][0]} ({rp(best[-1][1])})")
+    lines.append("(Fees included. Full list is in live_signals.csv in your GitHub repo.)")
+    return "\n".join(lines)
+
+
+def maybe_send_monthly_report(state):
+    now = datetime.now(IST)
+    this_month = now.strftime("%Y-%m")
+    last = state.get("report_month")
+    if last is None:
+        state["report_month"] = this_month
+        return
+    if last != this_month:
+        prev = (now.replace(day=1) - timedelta(days=1))
+        telegram_send(month_report(prev.year, prev.month))
+        state["report_month"] = this_month
+
+
+# ----------------------------------------------------------------------------
 # Modes
 # ----------------------------------------------------------------------------
+def run_report():
+    now = datetime.now(IST)
+    msg = month_report(now.year, now.month,
+                       title=f"📅 <b>Report so far — {now.strftime('%B %Y')}</b> "
+                             f"(1st to {now.strftime('%d')})")
+    telegram_send(msg)
+    print(msg)
+    return 0
+
+
 def run_scan():
     state = load_state()
     save_state(state)
     try:
+        mkt = Market()
+        # 1) check results of earlier signals + monthly report (even when paused)
+        try:
+            update_open_signals(mkt)
+        except Exception as e:
+            print("[track] error:", e)
+        try:
+            maybe_send_monthly_report(state)
+            save_state(state)
+        except Exception as e:
+            print("[report] error:", e)
+        # 2) make sure a tested rule set is chosen
         active = state.get("active")
         if not active or time.time() - active.get("updated", 0) > 24 * 3600:
             print("[scan] rule-set test is missing or older than 24h -> testing now")
             backtest_and_choose(state, announce=False)
             save_state(state)
             active = state["active"]
-        if not active.get("variant"):
+        if not active.get("variant") or active["variant"] not in VARIANTS:
             print("[scan] paused: no profitable rule set right now")
             return 0
         P = VARIANTS[active["variant"]]
-        mkt = Market()
         groups = build_watchlist(mkt)
         btc = indicators(mkt.klines("BTCUSDT", "1h", 500))
     except Exception as e:
@@ -802,6 +1005,10 @@ def run_scan():
             if time.time() - state["sent"].get(sym, 0) < COOLDOWN_HOURS * 3600:
                 break
             telegram_send(format_signal(sig, group, mkt.mode, active))
+            try:
+                log_signal(sig, group, active["variant"])
+            except Exception as e:
+                print("[log] error:", e)
             state["sent"][sym] = time.time()
             sent += 1
             print(f"[scan] SIGNAL {sig['side']} {sym} @ {sig['entry']}")
@@ -836,4 +1043,6 @@ if __name__ == "__main__":
         sys.exit(run_backtest())
     if mode == "test":
         sys.exit(run_test_message())
+    if mode == "report":
+        sys.exit(run_report())
     sys.exit(run_scan())
