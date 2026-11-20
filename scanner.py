@@ -2,23 +2,24 @@
 """
 Crypto futures signal scanner (signals only - no auto trading).
 
-Strategy (trend pullback, multi-timeframe):
-  * 1h chart  -> decides the direction (trend must be clear and strong)
-  * 15m chart -> waits for a pullback to EMA20 and a confirmed bounce
-  * BTC 1h    -> must not be moving against the trade
-Only signals that pass EVERY check are sent. No "skip" / "no trade" messages.
+HOW IT PROTECTS YOU
+  * Several rule sets ("strategies") are tested on the last ~30 days of data.
+  * Only a rule set that made a profit in BOTH halves of that period is used live.
+  * If no rule set is profitable, live signals are PAUSED (you get one notice).
+  * The test repeats automatically once a day, so the choice follows the market.
 
-Coins scanned each run (max 40):
-  * your coins in favorites.txt (one per line, e.g. NEARUSDT or NEAR)
-  * top 10 gainers of the last 24h
-  * top 10 losers of the last 24h
+Every signal: 1h chart decides direction, 15m chart gives the entry,
+BTC must not move against the trade. English messages only.
+
+Coins scanned (max 40): favorites.txt + top 10 gainers + top 10 losers (24h).
 
 Usage:
-  python scanner.py scan       -> normal run (used every 15 min by GitHub Actions)
-  python scanner.py backtest   -> tests the same rules on past data and sends the win rate
-  python scanner.py test       -> sends one test message to Telegram
+  python scanner.py scan          -> live run (every 15 min)
+  python scanner.py backtest      -> full test, sends the comparison table
+  python scanner.py autobacktest  -> daily silent test (message only if choice changes)
+  python scanner.py test          -> sends one test message to Telegram
 
-Only the Python standard library is used, so nothing needs to be installed.
+Only the Python standard library is used.
 """
 
 import bisect
@@ -32,19 +33,36 @@ import urllib.request
 from datetime import datetime, timedelta, timezone
 
 # ----------------------------------------------------------------------------
-# SETTINGS (safe to change)
+# SETTINGS
 # ----------------------------------------------------------------------------
 FAV_FILE = "favorites.txt"
 STATE_FILE = "state.json"
-TOP_N = 10                      # top gainers / top losers to add
-MIN_QUOTE_VOLUME = 20_000_000   # gainers/losers need >= 20M USDT 24h volume
-COOLDOWN_HOURS = 4              # no repeat signal for the same coin within 4h
-TP1_R = 1.0                     # Target 1 = 1x risk
-TP2_R = 2.0                     # Target 2 = 2x risk
-MIN_RISK_PCT = 0.4              # stop closer than 0.4% = too tight (fees/noise)
-MAX_RISK_PCT = 4.0              # stop wider than 4% = too risky, skip
-BACKTEST_MAX_BARS = 48          # backtest: close trade after 12h (48 x 15m)
-FEE_PCT_ROUND_TRIP = 0.10       # backtest: taker fees in + out
+TOP_N = 10
+MIN_QUOTE_VOLUME = 20_000_000
+COOLDOWN_HOURS = 4
+MIN_RISK_PCT = 0.4
+MAX_RISK_PCT = 4.0
+BACKTEST_DAYS = 30
+BACKTEST_MAX_BARS = 48            # close a test trade after 12h
+FEE_PCT_ROUND_TRIP = 0.10
+MIN_TRADES_TO_TRUST = 20          # rule set needs at least this many test trades
+BACKTEST_MAX_AGE_HOURS = 30       # live scan re-tests if the last test is older
+
+# Rule sets that are tested. Live uses the best one that is profitable.
+VARIANTS = {
+    "A": {"name": "Trend breakout", "entry": "breakout", "adx": 20,
+          "sl_buf": 0.2, "tp1": 1.0, "tp2": 2.0, "vol": 1.2, "max_risk_atr": 2.5},
+    "B": {"name": "Trend breakout, wide stop", "entry": "breakout", "adx": 20,
+          "sl_buf": 1.0, "tp1": 0.8, "tp2": 1.6, "vol": 1.2, "max_risk_atr": 3.5},
+    "C": {"name": "Strong-trend breakout", "entry": "breakout", "adx": 28,
+          "sl_buf": 0.6, "tp1": 0.8, "tp2": 1.6, "vol": 1.0, "max_risk_atr": 3.0},
+    "D": {"name": "Dip buy / rally sell in trend", "entry": "dip", "adx": 20,
+          "sl_buf": 0.5, "tp1": 1.0, "tp2": 2.0, "vol": 0.0, "max_risk_atr": 3.0},
+    "E": {"name": "Dip in trend, wide stop", "entry": "dip", "adx": 20,
+          "sl_buf": 1.0, "tp1": 0.8, "tp2": 1.6, "vol": 0.0, "max_risk_atr": 3.5},
+    "F": {"name": "Dip in strong trend", "entry": "dip", "adx": 28,
+          "sl_buf": 0.8, "tp1": 0.8, "tp2": 1.6, "vol": 0.0, "max_risk_atr": 3.5},
+}
 
 DEFAULT_FAVORITES = [
     "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT",
@@ -52,22 +70,19 @@ DEFAULT_FAVORITES = [
     "NEARUSDT", "LTCUSDT", "TRXUSDT", "SUIUSDT", "APTUSDT",
     "ARBUSDT", "OPUSDT", "INJUSDT", "ATOMUSDT", "FILUSDT",
 ]
-
 STABLE_BASES = {
     "USDC", "FDUSD", "TUSD", "BUSD", "USDP", "DAI", "USDE", "EUR", "PAXG",
     "AEUR", "XUSD", "USD1", "BFUSD", "RLUSD", "EURI",
 }
-
 IST = timezone(timedelta(hours=5, minutes=30))
 UA = {"User-Agent": "Mozilla/5.0 (signal-scanner)"}
-
 FUTURES_HOSTS = ["https://fapi.binance.com", "https://fapi1.binance.com",
                  "https://fapi2.binance.com"]
 SPOT_HOST = "https://data-api.binance.vision"
 
 
 # ----------------------------------------------------------------------------
-# HTTP helpers
+# HTTP
 # ----------------------------------------------------------------------------
 class HttpError(Exception):
     def __init__(self, code, msg=""):
@@ -86,22 +101,18 @@ def http_get(url, params=None, retries=3, timeout=20):
                 return json.loads(r.read().decode())
         except urllib.error.HTTPError as e:
             last = HttpError(e.code, url)
-            # 451/403 = region blocked -> do not retry, caller switches source
-            if e.code in (403, 451, 400, 404):
+            if e.code in (400, 403, 404, 451):
                 raise last
-            if e.code == 429 or e.code == 418:
-                time.sleep(5 * (attempt + 1))
-            else:
-                time.sleep(1.5 * (attempt + 1))
-        except Exception as e:  # network hiccup
+            time.sleep((5 if e.code in (418, 429) else 1.5) * (attempt + 1))
+        except Exception as e:
             last = e
             time.sleep(1.5 * (attempt + 1))
     raise last
 
 
 # ----------------------------------------------------------------------------
-# Market data source: Binance Futures, falls back to Binance spot data API
-# (GitHub's US servers are often blocked by Binance Futures with HTTP 451).
+# Market data (Binance Futures; falls back to Binance spot data API because
+# GitHub's US servers are usually blocked by Binance Futures)
 # ----------------------------------------------------------------------------
 class Market:
     def __init__(self):
@@ -119,23 +130,42 @@ class Market:
             self.mode, self.host = "spot", SPOT_HOST
         print(f"[data] using {self.mode} data from {self.host}")
 
-    def kline_limit_max(self):
-        return 1500 if self.mode == "futures" else 1000
-
-    def klines(self, symbol, interval, limit):
+    def _raw(self, symbol, interval, limit, end_time=None):
         path = "/fapi/v1/klines" if self.mode == "futures" else "/api/v3/klines"
-        raw = http_get(self.host + path,
-                       {"symbol": symbol, "interval": interval, "limit": limit})
+        p = {"symbol": symbol, "interval": interval, "limit": limit}
+        if end_time:
+            p["endTime"] = end_time
+        return http_get(self.host + path, p)
+
+    def klines(self, symbol, interval, total):
+        """Fetch `total` candles (pages backwards if needed). Closed candles only."""
+        page = 1500 if self.mode == "futures" else 1000
+        rows, end = [], None
+        while len(rows) < total:
+            need = min(page, total - len(rows))
+            batch = self._raw(symbol, interval, need, end)
+            if not batch:
+                break
+            rows = batch + rows
+            end = int(batch[0][0]) - 1
+            if len(batch) < need:
+                break
+        seen, clean = set(), []
+        for r in rows:
+            if r[0] not in seen:
+                seen.add(r[0])
+                clean.append(r)
+        clean.sort(key=lambda r: r[0])
         now_ms = int(time.time() * 1000)
-        rows = [r for r in raw if int(r[6]) < now_ms]  # closed candles only
+        clean = [r for r in clean if int(r[6]) < now_ms]
         return {
-            "t": [int(r[0]) for r in rows],
-            "tc": [int(r[6]) for r in rows],
-            "o": [float(r[1]) for r in rows],
-            "h": [float(r[2]) for r in rows],
-            "l": [float(r[3]) for r in rows],
-            "c": [float(r[4]) for r in rows],
-            "v": [float(r[7]) for r in rows],  # quote volume (USDT)
+            "t": [int(r[0]) for r in clean],
+            "tc": [int(r[6]) for r in clean],
+            "o": [float(r[1]) for r in clean],
+            "h": [float(r[2]) for r in clean],
+            "l": [float(r[3]) for r in clean],
+            "c": [float(r[4]) for r in clean],
+            "v": [float(r[7]) for r in clean],
         }
 
     def tradable_symbols(self):
@@ -145,7 +175,7 @@ class Market:
                     if s.get("quoteAsset") == "USDT"
                     and s.get("contractType") == "PERPETUAL"
                     and s.get("status") == "TRADING"}
-        return None  # spot mode: filter by name + volume instead
+        return None
 
     def tickers_24h(self):
         path = "/fapi/v1/ticker/24hr" if self.mode == "futures" else "/api/v3/ticker/24hr"
@@ -196,33 +226,26 @@ def build_watchlist(mkt):
         tradable = mkt.tradable_symbols()
     except Exception as e:
         print("[coins] exchangeInfo failed:", e)
-
-    tickers = mkt.tickers_24h()
     rows = []
-    for t in tickers:
+    for t in mkt.tickers_24h():
         sym = t.get("symbol", "")
         if not is_clean_usdt_symbol(sym):
             continue
         if tradable is not None and sym not in tradable:
             continue
         try:
-            qv = float(t["quoteVolume"])
-            chg = float(t["priceChangePercent"])
+            rows.append((sym, float(t["priceChangePercent"]), float(t["quoteVolume"])))
         except (KeyError, ValueError, TypeError):
             continue
-        rows.append((sym, chg, qv))
-
     valid = {r[0] for r in rows}
     favs_ok = [s for s in favs if s in valid]
     dropped = [s for s in favs if s not in valid]
     if dropped:
         print("[coins] not found / not tradable, ignored:", ", ".join(dropped))
-
     liquid = [r for r in rows if r[2] >= MIN_QUOTE_VOLUME and r[0] not in favs_ok]
     gainers = [r[0] for r in sorted(liquid, key=lambda r: r[1], reverse=True)[:TOP_N]]
-    losers_pool = [r for r in liquid if r[0] not in gainers]
-    losers = [r[0] for r in sorted(losers_pool, key=lambda r: r[1])[:TOP_N]]
-
+    losers = [r[0] for r in sorted([r for r in liquid if r[0] not in gainers],
+                                   key=lambda r: r[1])[:TOP_N]]
     groups = {}
     for s in favs_ok:
         groups[s] = "Your list"
@@ -358,17 +381,16 @@ def indicators(k):
 
 
 # ----------------------------------------------------------------------------
-# The strategy (same function for live scan and backtest)
+# Strategy (one function, used by live scan AND backtest)
 # ----------------------------------------------------------------------------
 def _ok(*vals):
     return all(x is not None for x in vals)
 
 
-def evaluate(sym, m15, i, h1, j, btc, jb, side):
-    """Return a signal dict, or None if any check fails.
-    m15/h1/btc: indicator dicts; i/j/jb: index of the last CLOSED candle to use.
-    side: +1 LONG, -1 SHORT."""
+def evaluate(sym, m15, i, h1, j, btc, jb, side, P):
+    """Return a signal dict or None. side: +1 LONG, -1 SHORT. P: rule set."""
     d = side
+    dip = P["entry"] == "dip"
     if i < 30 or j < 10:
         return None
 
@@ -379,17 +401,18 @@ def evaluate(sym, m15, i, h1, j, btc, jb, side):
     if not _ok(c1, e50, e200, e50_prev, adx1, rsi1, atr1) or atr1 <= 0:
         return None
     if not (d * (c1 - e50) > 0 and d * (e50 - e200) > 0):
-        return None                                   # trend not aligned
-    if d * (e50 - e50_prev) <= 0:
-        return None                                   # EMA50 not sloping our way
-    if adx1 < 20:
-        return None                                   # trend too weak / choppy
-    if d == 1 and not (50 <= rsi1 <= 70):
         return None
-    if d == -1 and not (30 <= rsi1 <= 50):
+    if d * (e50 - e50_prev) <= 0:
+        return None
+    if adx1 < P["adx"]:
+        return None
+    lo, hi = (45, 70) if dip else (50, 70)
+    if d == -1:
+        lo, hi = 100 - hi, 100 - lo
+    if not (lo <= rsi1 <= hi):
         return None
     if d * (c1 - e50) > 2.5 * atr1:
-        return None                                   # too extended, late entry
+        return None
 
     # ---- BTC filter ----------------------------------------------------
     if sym != "BTCUSDT" and btc is not None:
@@ -407,77 +430,90 @@ def evaluate(sym, m15, i, h1, j, btc, jb, side):
     a, r, hist, vs = m15["atr"][i], m15["rsi"], m15["hist"], m15["vsma"]
     if not _ok(a, e20[i], e50m[i], r[i], r[i - 1], hist[i], hist[i - 1], vs[i - 1]):
         return None
+    if any(x is None for x in r[i - 4:i]):
+        return None
     if a <= 0 or c[i] <= 0:
         return None
-    if d * (e20[i] - e50m[i]) <= 0:
-        return None                                   # 15m trend not aligned
-
-    look = range(i - 5, i)                            # last 5 candles before trigger
-    if any(e20[k] is None for k in look):
-        return None
-    if d == 1:
-        touched = any(l[k] <= e20[k] + 0.2 * a for k in look)
-        held = min(l[i - 5:i + 1]) >= e50m[i] - 0.5 * a
-    else:
-        touched = any(h[k] >= e20[k] - 0.2 * a for k in look)
-        held = max(h[i - 5:i + 1]) <= e50m[i] + 0.5 * a
-    if not (touched and held):
-        return None                                   # no clean pullback
-
-    if d * (c[i] - o[i]) <= 0 or d * (c[i] - e20[i]) <= 0:
-        return None                                   # trigger candle wrong colour/side
-    if d == 1 and not c[i] > h[i - 1]:
-        return None                                   # no break of previous high
-    if d == -1 and not c[i] < l[i - 1]:
-        return None
     if abs(c[i] - o[i]) > 1.8 * a:
-        return None                                   # spike candle, don't chase
-
-    if d == 1 and not (50 <= r[i] <= 68 and r[i] > r[i - 1]):
-        return None
-    if d == -1 and not (32 <= r[i] <= 50 and r[i] < r[i - 1]):
-        return None
-    if d * (hist[i] - hist[i - 1]) <= 0:
-        return None                                   # momentum not turning our way
+        return None                                  # spike candle, don't chase
     vol_ratio = v[i] / vs[i - 1] if vs[i - 1] > 0 else 0
-    if vol_ratio < 1.2:
-        return None                                   # no volume confirmation
+
+    if dip:
+        if d == 1:
+            if not (min(r[i - 4:i]) < 35 and r[i - 1] < r[i] < 55):
+                return None
+        else:
+            if not (max(r[i - 4:i]) > 65 and 45 < r[i] < r[i - 1]):
+                return None
+        if d * (c[i] - o[i]) <= 0 or d * (c[i] - c[i - 1]) <= 0:
+            return None                              # no reversal candle
+    else:
+        if d * (e20[i] - e50m[i]) <= 0:
+            return None
+        if any(e20[k] is None for k in range(i - 5, i)):
+            return None
+        if d == 1:
+            touched = any(l[k] <= e20[k] + 0.2 * a for k in range(i - 5, i))
+            held = min(l[i - 5:i + 1]) >= e50m[i] - 0.5 * a
+        else:
+            touched = any(h[k] >= e20[k] - 0.2 * a for k in range(i - 5, i))
+            held = max(h[i - 5:i + 1]) <= e50m[i] + 0.5 * a
+        if not (touched and held):
+            return None
+        if d * (c[i] - o[i]) <= 0 or d * (c[i] - e20[i]) <= 0:
+            return None
+        if d == 1 and not c[i] > h[i - 1]:
+            return None
+        if d == -1 and not c[i] < l[i - 1]:
+            return None
+        if d == 1 and not (50 <= r[i] <= 68 and r[i] > r[i - 1]):
+            return None
+        if d == -1 and not (32 <= r[i] <= 50 and r[i] < r[i - 1]):
+            return None
+        if d * (hist[i] - hist[i - 1]) <= 0:
+            return None
+        if vol_ratio < P["vol"]:
+            return None
 
     # ---- Stop-loss / targets ------------------------------------------
     entry = c[i]
     if d == 1:
-        swing = min(l[i - 5:i + 1]) - 0.2 * a
+        swing = min(l[i - 5:i + 1]) - P["sl_buf"] * a
     else:
-        swing = max(h[i - 5:i + 1]) + 0.2 * a
-    risk = abs(entry - swing)
-    risk = max(risk, 0.8 * a)
-    if risk > 2.5 * a:
+        swing = max(h[i - 5:i + 1]) + P["sl_buf"] * a
+    risk = max(abs(entry - swing), 0.8 * a)
+    if risk > P["max_risk_atr"] * a:
         return None
     risk_pct = risk / entry * 100
     if risk_pct < MIN_RISK_PCT or risk_pct > MAX_RISK_PCT:
         return None
 
-    sl = entry - d * risk
-    tp1 = entry + d * risk * TP1_R
-    tp2 = entry + d * risk * TP2_R
-
-    side_word = "uptrend" if d == 1 else "downtrend"
-    reasons = [
-        f"1h {side_word}: price {'above' if d == 1 else 'below'} EMA50 & EMA200, "
-        f"ADX {adx1:.0f} (strong trend)",
-        f"15m pullback to EMA20, then {'bullish' if d == 1 else 'bearish'} candle "
-        f"broke the previous {'high' if d == 1 else 'low'}",
-        f"RSI 15m {r[i]:.0f} {'rising' if d == 1 else 'falling'}, MACD momentum "
-        f"turning {'up' if d == 1 else 'down'}",
-        f"Volume {vol_ratio:.1f}x the 20-candle average",
-    ]
+    up = d == 1
+    reasons = [f"1h {'uptrend' if up else 'downtrend'}: price {'above' if up else 'below'} "
+               f"EMA50 & EMA200, ADX {adx1:.0f}"]
+    if dip:
+        reasons += [
+            f"15m RSI {'dipped below 35' if up else 'rose above 65'} and is now turning "
+            f"{'up' if up else 'down'} ({r[i]:.0f})",
+            f"{'Bullish' if up else 'Bearish'} reversal candle closed "
+            f"{'above' if up else 'below'} the previous close",
+        ]
+    else:
+        reasons += [
+            f"15m pullback to EMA20, then {'bullish' if up else 'bearish'} candle broke "
+            f"the previous {'high' if up else 'low'}",
+            f"RSI 15m {r[i]:.0f} {'rising' if up else 'falling'}, MACD turning "
+            f"{'up' if up else 'down'}, volume {vol_ratio:.1f}x average",
+        ]
     if sym != "BTCUSDT" and btc is not None:
-        reasons.append(f"BTC 1h supports the move ({'above' if d == 1 else 'below'} EMA50)")
+        reasons.append(f"BTC 1h supports the move ({'above' if up else 'below'} EMA50)")
 
     return {
-        "symbol": sym, "side": "LONG" if d == 1 else "SHORT", "d": d,
-        "entry": entry, "sl": sl, "tp1": tp1, "tp2": tp2, "risk": risk,
-        "risk_pct": risk_pct, "reasons": reasons, "candle_time": m15["t"][i],
+        "symbol": sym, "side": "LONG" if up else "SHORT", "d": d,
+        "entry": entry, "sl": entry - d * risk,
+        "tp1": entry + d * risk * P["tp1"], "tp2": entry + d * risk * P["tp2"],
+        "tp1_r": P["tp1"], "tp2_r": P["tp2"], "risk": risk, "risk_pct": risk_pct,
+        "reasons": reasons, "candle_time": m15["t"][i],
     }
 
 
@@ -498,10 +534,11 @@ def pct(a, b):
     return (b - a) / a * 100
 
 
-def format_signal(s, group, data_mode):
+def format_signal(s, group, data_mode, active):
     emoji = "🟢" if s["side"] == "LONG" else "🔴"
     e = s["entry"]
     now = datetime.now(IST).strftime("%d %b %Y, %I:%M %p IST")
+    P = VARIANTS[active["variant"]]
     lines = [
         f"{emoji} <b>{s['side']} — {s['symbol']}</b>",
         f"<i>{group}</i>",
@@ -513,16 +550,18 @@ def format_signal(s, group, data_mode):
         "",
         "<b>Reasons:</b>",
     ]
-    lines += [f"• {r}" for r in s["reasons"]]
+    lines += [f"• {x}" for x in s["reasons"]]
     lines += [
         "",
         "<b>Plan:</b> At Target 1 book half and move stop-loss to entry. "
-        "Skip if price has already moved more than 0.5% from entry.",
+        "Skip if price already moved more than 0.5% from entry.",
         "",
-        f"Timeframes: 1h trend + 15m entry  |  {now}",
+        f"Rule set: {P['name']} — last {BACKTEST_DAYS} days test: "
+        f"{active['win']:.0f}% win, {active['n']} trades",
+        f"1h trend + 15m entry  |  {now}",
     ]
     if data_mode == "spot":
-        lines.append("Note: prices from Binance spot feed (futures price may differ slightly).")
+        lines.append("Prices from Binance spot feed (futures price may differ slightly).")
     lines.append("⚠️ Paper trade first — not financial advice.")
     return "\n".join(lines)
 
@@ -534,12 +573,12 @@ def telegram_send(text):
         print("[telegram] token/chat id not set -> printing instead:\n" + text + "\n")
         return False
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-    for chunk_start in range(0, len(text), 4000):
+    for start in range(0, len(text), 4000):
         body = urllib.parse.urlencode({
-            "chat_id": chat, "text": text[chunk_start:chunk_start + 4000],
+            "chat_id": chat, "text": text[start:start + 4000],
             "parse_mode": "HTML", "disable_web_page_preview": "true",
         }).encode()
-        for attempt in range(3):
+        for _ in range(3):
             try:
                 req = urllib.request.Request(url, data=body, headers=UA)
                 urllib.request.urlopen(req, timeout=20).read()
@@ -556,15 +595,15 @@ def telegram_send(text):
 
 
 # ----------------------------------------------------------------------------
-# State (stops duplicate signals)
+# State (remembers sent signals and the chosen rule set between runs)
 # ----------------------------------------------------------------------------
 def load_state():
     try:
         with open(STATE_FILE, encoding="utf-8") as f:
             s = json.load(f)
-            if isinstance(s, dict):
-                s.setdefault("sent", {})
-                return s
+        if isinstance(s, dict):
+            s.setdefault("sent", {})
+            return s
     except Exception:
         pass
     return {"sent": {}, "last_error_alert": 0}
@@ -572,10 +611,144 @@ def load_state():
 
 def save_state(state):
     now = time.time()
-    state["sent"] = {k: v for k, v in state.get("sent", {}).items()
-                     if now - v < 3 * 86400}
+    state["sent"] = {k: v for k, v in state.get("sent", {}).items() if now - v < 3 * 86400}
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f)
+
+
+# ----------------------------------------------------------------------------
+# Backtest
+# ----------------------------------------------------------------------------
+def simulate(m15, i, sig):
+    d, e, sl, tp1, tp2, risk = sig["d"], sig["entry"], sig["sl"], sig["tp1"], sig["tp2"], sig["risk"]
+    r1, r2 = sig["tp1_r"], sig["tp2_r"]
+    fee_r = (FEE_PCT_ROUND_TRIP / 100 * e) / risk
+    hit1, stop = False, sl
+    end = min(len(m15["c"]) - 1, i + BACKTEST_MAX_BARS)
+    if end <= i:
+        return "open", 0.0, i
+    for k in range(i + 1, end + 1):
+        hi, lo = m15["h"][k], m15["l"][k]
+        adverse = lo <= stop if d == 1 else hi >= stop
+        reach1 = hi >= tp1 if d == 1 else lo <= tp1
+        reach2 = hi >= tp2 if d == 1 else lo <= tp2
+        if not hit1:
+            if adverse:                       # stop and target same candle = loss
+                return "loss", -1.0 - fee_r, k
+            if reach1:
+                hit1, stop = True, e
+                if reach2:
+                    return "tp2", 0.5 * r1 + 0.5 * r2 - fee_r, k
+            continue
+        if adverse:
+            return "tp1", 0.5 * r1 - fee_r, k
+        if reach2:
+            return "tp2", 0.5 * r1 + 0.5 * r2 - fee_r, k
+    rm = d * (m15["c"][end] - e) / risk
+    if hit1:
+        return "tp1", 0.5 * r1 + 0.5 * max(rm, 0) - fee_r, end
+    return "timeout", rm - fee_r, end
+
+
+def run_all_backtests(mkt, groups):
+    n15 = BACKTEST_DAYS * 96 + 300
+    n1h = BACKTEST_DAYS * 24 + 300
+    start_ms = int((time.time() - BACKTEST_DAYS * 86400) * 1000)
+    btc = indicators(mkt.klines("BTCUSDT", "1h", n1h))
+    data = {}
+    for sym in groups:
+        try:
+            m15 = indicators(mkt.klines(sym, "15m", n15))
+            h1 = btc if sym == "BTCUSDT" else indicators(mkt.klines(sym, "1h", n1h))
+            data[sym] = (m15, h1)
+        except Exception as e:
+            print(f"[bt] {sym}: data error {e}")
+        time.sleep(0.05)
+
+    results = {}
+    for key, P in VARIANTS.items():
+        trades = []
+        for sym, (m15, h1) in data.items():
+            busy_until = -1
+            for i in range(60, len(m15["c"]) - 1):
+                if i <= busy_until or m15["t"][i] < start_ms:
+                    continue
+                tc = m15["tc"][i]
+                j = bisect.bisect_right(h1["tc"], tc) - 1
+                jb = bisect.bisect_right(btc["tc"], tc) - 1
+                if j < 210 or jb < 210:
+                    continue
+                for side in (1, -1):
+                    sig = evaluate(sym, m15, i, h1, j, btc, jb, side, P)
+                    if sig:
+                        res, rr, exit_i = simulate(m15, i, sig)
+                        if res != "open":
+                            trades.append((sym, sig["side"], res, rr, m15["t"][i]))
+                            busy_until = max(exit_i, i + COOLDOWN_HOURS * 4)
+                        break
+        results[key] = stats(trades, start_ms)
+    return results, len(data), mkt.mode
+
+
+def stats(trades, start_ms):
+    n = len(trades)
+    mid = start_ms + (time.time() * 1000 - start_ms) / 2
+    first = [t for t in trades if t[4] < mid]
+    second = [t for t in trades if t[4] >= mid]
+
+    def win(ts):
+        return sum(1 for t in ts if t[2] in ("tp1", "tp2")) / len(ts) * 100 if ts else 0.0
+
+    return {
+        "n": n, "win": win(trades),
+        "tp2": (sum(1 for t in trades if t[2] == "tp2") / n * 100) if n else 0.0,
+        "net": sum(t[3] for t in trades),
+        "net1": sum(t[3] for t in first), "net2": sum(t[3] for t in second),
+        "long": sum(1 for t in trades if t[1] == "LONG"),
+        "short": sum(1 for t in trades if t[1] == "SHORT"),
+    }
+
+
+def choose(results):
+    good = [(k, s) for k, s in results.items()
+            if s["n"] >= MIN_TRADES_TO_TRUST and s["net"] > 0 and s["net1"] > 0 and s["net2"] > 0]
+    if not good:
+        return None
+    good.sort(key=lambda ks: (ks[1]["win"], ks[1]["net"]), reverse=True)
+    return good[0][0]
+
+
+def backtest_and_choose(state, announce):
+    mkt = Market()
+    groups = build_watchlist(mkt)
+    results, ncoins, mode = run_all_backtests(mkt, groups)
+    best = choose(results)
+    prev = (state.get("active") or {}).get("variant")
+    if best:
+        s = results[best]
+        state["active"] = {"variant": best, "win": round(s["win"], 1), "n": s["n"],
+                           "net": round(s["net"], 1), "updated": time.time()}
+    else:
+        state["active"] = {"variant": None, "updated": time.time()}
+
+    lines = [f"📊 <b>Rule-set test</b> — last {BACKTEST_DAYS} days, {ncoins} coins (Binance {mode})", ""]
+    for k, s in results.items():
+        mark = "✅" if k == best else ("➖" if s["net"] > 0 else "❌")
+        lines.append(f"{mark} {k} {VARIANTS[k]['name']}: {s['n']} trades, win {s['win']:.0f}%, "
+                     f"net {s['net']:+.1f}R (halves {s['net1']:+.1f} / {s['net2']:+.1f})")
+    lines.append("")
+    if best:
+        lines.append(f"✅ <b>Live signals now use rule set {best}: {VARIANTS[best]['name']}</b>")
+    else:
+        lines.append("⏸ <b>Live signals PAUSED</b> — no rule set made a profit in both halves of "
+                     "the test period. The test repeats daily and signals restart automatically.")
+    lines.append("R = amount risked per trade, fees included. Past results do not guarantee "
+                 "future results.")
+    msg = "\n".join(lines)
+    print(msg.replace("<b>", "").replace("</b>", ""))
+    if announce or best != prev:
+        telegram_send(msg)
+    return best
 
 
 # ----------------------------------------------------------------------------
@@ -583,8 +756,18 @@ def save_state(state):
 # ----------------------------------------------------------------------------
 def run_scan():
     state = load_state()
-    save_state(state)  # make sure the file exists for the cache step
+    save_state(state)
     try:
+        active = state.get("active")
+        if not active or time.time() - active.get("updated", 0) > 24 * 3600:
+            print("[scan] rule-set test is missing or older than 24h -> testing now")
+            backtest_and_choose(state, announce=False)
+            save_state(state)
+            active = state["active"]
+        if not active.get("variant"):
+            print("[scan] paused: no profitable rule set right now")
+            return 0
+        P = VARIANTS[active["variant"]]
         mkt = Market()
         groups = build_watchlist(mkt)
         btc = indicators(mkt.klines("BTCUSDT", "1h", 500))
@@ -595,9 +778,9 @@ def run_scan():
                           "It will retry automatically every 15 minutes.")
             state["last_error_alert"] = time.time()
         save_state(state)
-        return 0  # alert already sent; avoid GitHub failure e-mails every 15 min
+        return 0
 
-    print(f"[scan] {len(groups)} coins: {', '.join(groups)}")
+    print(f"[scan] rule set {active['variant']} | {len(groups)} coins: {', '.join(groups)}")
     jb = len(btc["c"]) - 1
     sent = 0
     for sym, group in groups.items():
@@ -609,138 +792,30 @@ def run_scan():
             continue
         i, j = len(m15["c"]) - 1, len(h1["c"]) - 1
         if i < 60 or j < 210:
-            print(f"[scan] {sym}: not enough history, skipped")
             continue
-        # make sure the 15m candle is fresh (closed within the last 20 minutes)
         if time.time() * 1000 - m15["tc"][i] > 20 * 60 * 1000:
-            print(f"[scan] {sym}: stale data, skipped")
-            continue
+            continue  # stale data
         for side in (1, -1):
-            sig = evaluate(sym, m15, i, h1, j, btc, jb, side)
+            sig = evaluate(sym, m15, i, h1, j, btc, jb, side, P)
             if not sig:
                 continue
-            key = sym
-            last = state["sent"].get(key, 0)
-            if time.time() - last < COOLDOWN_HOURS * 3600:
-                print(f"[scan] {sym}: signal in cooldown, not resent")
-                continue
-            telegram_send(format_signal(sig, group, mkt.mode))
-            state["sent"][key] = time.time()
+            if time.time() - state["sent"].get(sym, 0) < COOLDOWN_HOURS * 3600:
+                break
+            telegram_send(format_signal(sig, group, mkt.mode, active))
+            state["sent"][sym] = time.time()
             sent += 1
             print(f"[scan] SIGNAL {sig['side']} {sym} @ {sig['entry']}")
+            break
         time.sleep(0.05)
-
     save_state(state)
     print(f"[scan] done. signals sent: {sent}")
     return 0
 
 
-def simulate(m15, i, sig):
-    """Walk forward candle by candle. Returns (result, R multiple)."""
-    d, e, sl, tp1, tp2, risk = sig["d"], sig["entry"], sig["sl"], sig["tp1"], sig["tp2"], sig["risk"]
-    fee_r = (FEE_PCT_ROUND_TRIP / 100 * e) / risk
-    hit1 = False
-    stop = sl
-    end = min(len(m15["c"]) - 1, i + BACKTEST_MAX_BARS)
-    for k in range(i + 1, end + 1):
-        hi, lo = m15["h"][k], m15["l"][k]
-        adverse = lo <= stop if d == 1 else hi >= stop
-        if not hit1:
-            # same candle touches stop and target -> count as a loss (worst case)
-            if adverse:
-                return "loss", -1.0 - fee_r, k
-            if (hi >= tp1) if d == 1 else (lo <= tp1):
-                hit1 = True
-                stop = e  # move stop to entry
-                if (hi >= tp2) if d == 1 else (lo <= tp2):
-                    return "tp2", 0.5 * TP1_R + 0.5 * TP2_R - fee_r, k
-            continue
-        if adverse:
-            return "tp1", 0.5 * TP1_R - fee_r, k
-        if (hi >= tp2) if d == 1 else (lo <= tp2):
-            return "tp2", 0.5 * TP1_R + 0.5 * TP2_R - fee_r, k
-    if end <= i:
-        return "open", 0.0, i
-    last = m15["c"][end]
-    r_mult = d * (last - e) / risk
-    if hit1:
-        return "tp1", 0.5 * TP1_R + 0.5 * max(r_mult, 0) - fee_r, end
-    return "timeout", r_mult - fee_r, end
-
-
 def run_backtest():
-    mkt = Market()
-    groups = build_watchlist(mkt)
-    lim15 = mkt.kline_limit_max()
-    btc = indicators(mkt.klines("BTCUSDT", "1h", 1000))
-    trades = []
-    per_coin = {}
-    span_ms = 0
-    for sym in groups:
-        try:
-            m15 = indicators(mkt.klines(sym, "15m", lim15))
-            h1 = btc if sym == "BTCUSDT" else indicators(mkt.klines(sym, "1h", 1000))
-        except Exception as e:
-            print(f"[bt] {sym}: data error {e}")
-            continue
-        if len(m15["t"]) > 1:
-            span_ms = max(span_ms, m15["t"][-1] - m15["t"][0])
-        busy_until = -1
-        for i in range(60, len(m15["c"]) - 1):
-            if i <= busy_until:
-                continue
-            tclose = m15["tc"][i]
-            j = bisect.bisect_right(h1["tc"], tclose) - 1
-            jb = bisect.bisect_right(btc["tc"], tclose) - 1
-            if j < 210 or jb < 210:
-                continue
-            for side in (1, -1):
-                sig = evaluate(sym, m15, i, h1, j, btc, jb, side)
-                if sig:
-                    res, rr, exit_i = simulate(m15, i, sig)
-                    if res == "open":
-                        break
-                    trades.append((sym, sig["side"], res, rr, m15["t"][i]))
-                    per_coin.setdefault(sym, []).append(res)
-                    # same coin: wait until trade is closed and cooldown passed
-                    busy_until = max(exit_i, i + COOLDOWN_HOURS * 4)
-                    break
-        time.sleep(0.05)
-
-    n = len(trades)
-    if n == 0:
-        msg = "📊 Backtest: no signals in the test period. Rules may be too strict."
-        telegram_send(msg)
-        print(msg)
-        return 0
-    wins = sum(1 for t in trades if t[2] in ("tp1", "tp2"))
-    tp2 = sum(1 for t in trades if t[2] == "tp2")
-    losses = sum(1 for t in trades if t[2] == "loss")
-    tos = sum(1 for t in trades if t[2] == "timeout")
-    total_r = sum(t[3] for t in trades)
-    days = max(span_ms / 86400000, 1)
-    longs = [t for t in trades if t[1] == "LONG"]
-    shorts = [t for t in trades if t[1] == "SHORT"]
-
-    def wr(ts):
-        return (sum(1 for t in ts if t[2] in ("tp1", "tp2")) / len(ts) * 100) if ts else 0
-
-    msg = "\n".join([
-        "📊 <b>Backtest result</b> (same rules as live signals)",
-        f"Data: Binance {mkt.mode}, last ~{days:.0f} days, {len(groups)} coins",
-        "",
-        f"Total signals: <b>{n}</b> (~{n / days:.1f} per day)",
-        f"Win rate (Target 1 hit before stop): <b>{wins / n * 100:.0f}%</b>",
-        f"Reached Target 2: {tp2 / n * 100:.0f}%",
-        f"Stopped out: {losses / n * 100:.0f}%   |   Closed after 12h: {tos / n * 100:.0f}%",
-        f"LONG win rate: {wr(longs):.0f}% ({len(longs)})   SHORT win rate: {wr(shorts):.0f}% ({len(shorts)})",
-        f"Net result: {total_r:+.1f}R (R = amount risked per trade, fees included)",
-        "",
-        "Note: past results do not guarantee future results. Today's gainer/loser "
-        "list is used for the whole period.",
-    ])
-    telegram_send(msg)
-    print(msg.replace("<b>", "").replace("</b>", ""))
+    state = load_state()
+    backtest_and_choose(state, announce=True)
+    save_state(state)
     return 0
 
 
@@ -752,7 +827,12 @@ def run_test_message():
 
 if __name__ == "__main__":
     mode = (sys.argv[1] if len(sys.argv) > 1 else "scan").strip().lower()
-    if mode == "backtest":
+    if mode in ("backtest", "autobacktest"):
+        if mode == "autobacktest":
+            st = load_state()
+            backtest_and_choose(st, announce=False)
+            save_state(st)
+            sys.exit(0)
         sys.exit(run_backtest())
     if mode == "test":
         sys.exit(run_test_message())
