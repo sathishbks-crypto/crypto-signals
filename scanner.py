@@ -3,7 +3,7 @@
 Crypto futures signal scanner (signals only - no auto trading).
 
 HOW IT PROTECTS YOU
-  * Several rule sets ("strategies") are tested on the last ~30 days of data.
+  * 12 rule sets (fast 15m and slow 1h entries) are tested on the last ~60 days.
   * Only a rule set that made a profit in BOTH halves of that period is used live.
   * If no rule set is profitable, live signals are PAUSED (you get one notice).
   * The test repeats automatically once a day, so the choice follows the market.
@@ -40,11 +40,12 @@ FAV_FILE = "favorites.txt"
 STATE_FILE = "state.json"
 TOP_N = 10
 MIN_QUOTE_VOLUME = 20_000_000
-COOLDOWN_HOURS = 4
+COOLDOWN_BARS = 16                # no repeat signal for a coin within 16 entry candles
 MIN_RISK_PCT = 0.4
 MAX_RISK_PCT = 4.0
-BACKTEST_DAYS = 30
-BACKTEST_MAX_BARS = 48            # close a test trade after 12h
+BACKTEST_DAYS = 60
+BACKTEST_MAX_BARS = 48            # close a trade after 48 entry candles (12h on 15m, 48h on 1h)
+TF_MIN = {"15m": 15, "1h": 60, "4h": 240}
 FEE_PCT_ROUND_TRIP = 0.10
 MIN_TRADES_TO_TRUST = 20          # rule set needs at least this many test trades
 LOG_FILE = "live_signals.csv"     # every live signal + its real result
@@ -56,7 +57,7 @@ def rp(x):
 BACKTEST_MAX_AGE_HOURS = 30       # live scan re-tests if the last test is older
 
 # Rule sets that are tested. Live uses the best one that is profitable.
-VARIANTS = {
+_BASE = {
     "A": {"name": "Trend breakout", "entry": "breakout", "adx": 20,
           "sl_buf": 0.2, "tp1": 1.0, "tp2": 2.0, "vol": 1.2, "max_risk_atr": 2.5},
     "B": {"name": "Trend breakout, wide stop", "entry": "breakout", "adx": 20,
@@ -70,6 +71,13 @@ VARIANTS = {
     "F": {"name": "Dip in strong trend", "entry": "dip", "adx": 28,
           "sl_buf": 0.8, "tp1": 0.8, "tp2": 1.6, "vol": 0.0, "max_risk_atr": 3.5},
 }
+# A-F: 15m entry + 1h trend (fast)   G-L: same ideas on 1h entry + 4h trend (slow)
+VARIANTS = {}
+for _k, _v in _BASE.items():
+    VARIANTS[_k] = dict(_v, tf="15m", trend_tf="1h")
+for _k, _v in zip("GHIJKL", _BASE.values()):
+    VARIANTS[_k] = dict(_v, tf="1h", trend_tf="4h", name=_v["name"] + " (slow)",
+                        max_risk_pct=8.0)
 
 DEFAULT_FAVORITES = [
     "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT",
@@ -506,34 +514,35 @@ def evaluate(sym, m15, i, h1, j, btc, jb, side, P):
     if risk > P["max_risk_atr"] * a:
         return None
     risk_pct = risk / entry * 100
-    if risk_pct < MIN_RISK_PCT or risk_pct > MAX_RISK_PCT:
+    if risk_pct < MIN_RISK_PCT or risk_pct > P.get("max_risk_pct", MAX_RISK_PCT):
         return None
 
     up = d == 1
-    reasons = [f"1h {'uptrend' if up else 'downtrend'}: price {'above' if up else 'below'} "
+    TT, ET = P["trend_tf"], P["tf"]
+    reasons = [f"{TT} {'uptrend' if up else 'downtrend'}: price {'above' if up else 'below'} "
                f"EMA50 & EMA200, ADX {adx1:.0f}"]
     if dip:
         reasons += [
-            f"15m RSI {'dipped below 35' if up else 'rose above 65'} and is now turning "
+            f"{ET} RSI {'dipped below 35' if up else 'rose above 65'} and is now turning "
             f"{'up' if up else 'down'} ({r[i]:.0f})",
             f"{'Bullish' if up else 'Bearish'} reversal candle closed "
             f"{'above' if up else 'below'} the previous close",
         ]
     else:
         reasons += [
-            f"15m pullback to EMA20, then {'bullish' if up else 'bearish'} candle broke "
+            f"{ET} pullback to EMA20, then {'bullish' if up else 'bearish'} candle broke "
             f"the previous {'high' if up else 'low'}",
-            f"RSI 15m {r[i]:.0f} {'rising' if up else 'falling'}, MACD turning "
+            f"RSI {ET} {r[i]:.0f} {'rising' if up else 'falling'}, MACD turning "
             f"{'up' if up else 'down'}, volume {vol_ratio:.1f}x average",
         ]
     if sym != "BTCUSDT" and btc is not None:
-        reasons.append(f"BTC 1h supports the move ({'above' if up else 'below'} EMA50)")
+        reasons.append(f"BTC {TT} supports the move ({'above' if up else 'below'} EMA50)")
 
     return {
         "symbol": sym, "side": "LONG" if up else "SHORT", "d": d,
         "entry": entry, "sl": entry - d * risk,
         "tp1": entry + d * risk * P["tp1"], "tp2": entry + d * risk * P["tp2"],
-        "tp1_r": P["tp1"], "tp2_r": P["tp2"], "risk": risk, "risk_pct": risk_pct,
+        "tp1_r": P["tp1"], "tp2_r": P["tp2"], "tf": ET, "risk": risk, "risk_pct": risk_pct,
         "reasons": reasons, "candle_time": m15["t"][i],
     }
 
@@ -575,12 +584,12 @@ def format_signal(s, group, data_mode, active):
     lines += [
         "",
         "<b>Plan:</b> At Target 1 book half and move stop-loss to entry. "
-        "If nothing is hit within 12 hours, close the trade. "
+        f"If nothing is hit within {hold_hours(P['tf'])} hours, close the trade. "
         "Skip if price already moved more than 0.5% from entry.",
         "",
         f"Rule set: {P['name']} — last {BACKTEST_DAYS} days test: "
         f"{active['win']:.0f}% win, {active['n']} trades",
-        f"1h trend + 15m entry  |  {now}",
+        f"{P['trend_tf']} trend + {P['tf']} entry  |  {now}",
     ]
     if data_mode == "spot":
         lines.append("Prices from Binance spot feed (futures price may differ slightly).")
@@ -672,17 +681,21 @@ def simulate(m15, i, sig):
     return "timeout", rm - fee_r, end
 
 
+def hold_hours(tf):
+    return BACKTEST_MAX_BARS * TF_MIN[tf] // 60
+
+
 def run_all_backtests(mkt, groups):
-    n15 = BACKTEST_DAYS * 96 + 300
-    n1h = BACKTEST_DAYS * 24 + 300
     start_ms = int((time.time() - BACKTEST_DAYS * 86400) * 1000)
-    btc = indicators(mkt.klines("BTCUSDT", "1h", n1h))
+    need = {tf: BACKTEST_DAYS * 1440 // m + 300 for tf, m in TF_MIN.items()}
+    tfs = sorted({P["tf"] for P in VARIANTS.values()} | {P["trend_tf"] for P in VARIANTS.values()})
+    btc = {tf: indicators(mkt.klines("BTCUSDT", tf, need[tf]))
+           for tf in {P["trend_tf"] for P in VARIANTS.values()}}
     data = {}
     for sym in groups:
         try:
-            m15 = indicators(mkt.klines(sym, "15m", n15))
-            h1 = btc if sym == "BTCUSDT" else indicators(mkt.klines(sym, "1h", n1h))
-            data[sym] = (m15, h1)
+            data[sym] = {tf: (btc[tf] if sym == "BTCUSDT" and tf in btc
+                              else indicators(mkt.klines(sym, tf, need[tf]))) for tf in tfs}
         except Exception as e:
             print(f"[bt] {sym}: data error {e}")
         time.sleep(0.05)
@@ -690,23 +703,25 @@ def run_all_backtests(mkt, groups):
     results = {}
     for key, P in VARIANTS.items():
         trades = []
-        for sym, (m15, h1) in data.items():
+        bt = btc[P["trend_tf"]]
+        for sym, dd in data.items():
+            m15, h1 = dd[P["tf"]], dd[P["trend_tf"]]
             busy_until = -1
             for i in range(60, len(m15["c"]) - 1):
                 if i <= busy_until or m15["t"][i] < start_ms:
                     continue
                 tc = m15["tc"][i]
                 j = bisect.bisect_right(h1["tc"], tc) - 1
-                jb = bisect.bisect_right(btc["tc"], tc) - 1
+                jb = bisect.bisect_right(bt["tc"], tc) - 1
                 if j < 210 or jb < 210:
                     continue
                 for side in (1, -1):
-                    sig = evaluate(sym, m15, i, h1, j, btc, jb, side, P)
+                    sig = evaluate(sym, m15, i, h1, j, bt, jb, side, P)
                     if sig:
                         res, rr, exit_i = simulate(m15, i, sig)
                         if res != "open":
                             trades.append((sym, sig["side"], res, rr, m15["t"][i]))
-                            busy_until = max(exit_i, i + COOLDOWN_HOURS * 4)
+                            busy_until = max(exit_i, i + COOLDOWN_BARS)
                         break
         results[key] = stats(trades, start_ms)
     return results, len(data), mkt.mode
@@ -756,7 +771,7 @@ def backtest_and_choose(state, announce):
     lines = [f"📊 <b>Rule-set test</b> — last {BACKTEST_DAYS} days, {ncoins} coins (Binance {mode})", ""]
     for k, s in results.items():
         mark = "✅" if k == best else ("➖" if s["net"] > 0 else "❌")
-        lines.append(f"{mark} {k} {VARIANTS[k]['name']}: {s['n']} trades, win {s['win']:.0f}%, "
+        lines.append(f"{mark} {k} {VARIANTS[k]['name']} [{VARIANTS[k]['tf']}]: {s['n']} trades, win {s['win']:.0f}%, "
                      f"total {rp(s['net'])} (halves {rp(s['net1'])} / {rp(s['net2'])})")
     lines.append("")
     if best:
@@ -778,13 +793,13 @@ def backtest_and_choose(state, announce):
 # Live signal log + result tracking + monthly report
 # ----------------------------------------------------------------------------
 LOG_FIELDS = ["id", "time_ist", "symbol", "side", "entry", "sl", "tp1", "tp2",
-              "tp1_r", "tp2_r", "risk", "rule", "group", "candle_ms",
+              "tp1_r", "tp2_r", "risk", "rule", "tf", "group", "candle_ms",
               "status", "result", "r_multiple", "closed_ist"]
 RESULT_TEXT = {
     "tp2": "TARGET 2 HIT",
     "tp1": "TARGET 1 HIT (rest closed at entry)",
     "loss": "STOP-LOSS HIT",
-    "timeout": "CLOSED AFTER 12H",
+    "timeout": "CLOSED AT TIME LIMIT",
 }
 
 
@@ -817,7 +832,7 @@ def log_signal(sig, group, rule_key):
         "entry": f"{sig['entry']:.10g}", "sl": f"{sig['sl']:.10g}",
         "tp1": f"{sig['tp1']:.10g}", "tp2": f"{sig['tp2']:.10g}",
         "tp1_r": sig["tp1_r"], "tp2_r": sig["tp2_r"], "risk": f"{sig['risk']:.10g}",
-        "rule": rule_key, "group": group, "candle_ms": sig["candle_time"],
+        "rule": rule_key, "tf": sig.get("tf", "15m"), "group": group, "candle_ms": sig["candle_time"],
         "status": "OPEN", "result": "", "r_multiple": "", "closed_ist": "",
     })
     write_log(rows)
@@ -838,7 +853,8 @@ def update_open_signals(mkt):
                 "tp1_r": float(r["tp1_r"]), "tp2_r": float(r["tp2_r"]),
                 "risk": float(r["risk"]),
             }
-            k = mkt.klines_from(r["symbol"], "15m", int(r["candle_ms"]), BACKTEST_MAX_BARS + 5)
+            k = mkt.klines_from(r["symbol"], r.get("tf") or "15m", int(r["candle_ms"]),
+                                BACKTEST_MAX_BARS + 5)
         except Exception as e:
             print(f"[track] {r.get('symbol')}: {e}")
             continue
@@ -849,7 +865,7 @@ def update_open_signals(mkt):
         if res == "open":
             continue
         if res == "timeout" and not finished_window:
-            continue                                  # 12h not over yet
+            continue                                  # time limit not over yet
         if res == "tp1_end" and not finished_window:
             continue                                  # Target 1 hit, rest still running
         if res == "tp1_end":
@@ -906,7 +922,7 @@ def month_report(year, month, title=None):
         f"Target 2 hit: {t2}",
         f"Target 1 hit (rest at entry): {t1}",
         f"Stop-loss hit: {sl}",
-        f"Closed after 12h: {to}",
+        f"Closed at time limit: {to}",
         "",
         side_line("LONG") + "\n" + side_line("SHORT"),
         "",
@@ -973,7 +989,7 @@ def run_scan():
             return 0
         P = VARIANTS[active["variant"]]
         groups = build_watchlist(mkt)
-        btc = indicators(mkt.klines("BTCUSDT", "1h", 500))
+        btc = indicators(mkt.klines("BTCUSDT", P["trend_tf"], 500))
     except Exception as e:
         print("[scan] market data failed:", e)
         if time.time() - state.get("last_error_alert", 0) > 6 * 3600:
@@ -988,8 +1004,8 @@ def run_scan():
     sent = 0
     for sym, group in groups.items():
         try:
-            m15 = indicators(mkt.klines(sym, "15m", 300))
-            h1 = btc if sym == "BTCUSDT" else indicators(mkt.klines(sym, "1h", 500))
+            m15 = indicators(mkt.klines(sym, P["tf"], 300))
+            h1 = btc if sym == "BTCUSDT" else indicators(mkt.klines(sym, P["trend_tf"], 500))
         except Exception as e:
             print(f"[scan] {sym}: data error {e}")
             continue
@@ -1002,7 +1018,7 @@ def run_scan():
             sig = evaluate(sym, m15, i, h1, j, btc, jb, side, P)
             if not sig:
                 continue
-            if time.time() - state["sent"].get(sym, 0) < COOLDOWN_HOURS * 3600:
+            if time.time() - state["sent"].get(sym, 0) < COOLDOWN_BARS * TF_MIN[P["tf"]] * 60:
                 break
             telegram_send(format_signal(sig, group, mkt.mode, active))
             try:
