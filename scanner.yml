@@ -1,0 +1,77 @@
+name: Signal Scanner
+
+on:
+  schedule:
+    # 3 minutes after every 1-hour candle closes
+    - cron: "3 * * * *"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "scan = normal | backtest = test rule sets | simulate = auto-trade test with your settings | report = this month | test = test message"
+        required: true
+        default: "scan"
+        type: choice
+        options:
+          - scan
+          - backtest
+          - report
+          - simulate
+          - test
+
+permissions:
+  contents: write
+
+concurrency:
+  group: signal-scanner
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Get code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Load memory of sent signals
+        uses: actions/cache/restore@v4
+        with:
+          path: state.json
+          key: scanner-state-${{ github.run_id }}
+          restore-keys: |
+            scanner-state-
+
+      - name: Run scanner
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN || secrets.TELEGRAM_TOKEN || secrets.BOT_TOKEN || secrets.TG_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID || secrets.CHAT_ID || secrets.TG_CHAT_ID }}
+          MODE: ${{ github.event.inputs.mode || 'scan' }}
+        run: python scanner.py "$MODE"
+
+      - name: Save memory of sent signals
+        if: always()
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: state.json
+          key: scanner-state-${{ github.run_id }}
+
+      - name: Save signal results file to the repo
+        if: always()
+        continue-on-error: true
+        run: |
+          if [ -f live_signals.csv ] && [ -n "$(git status --porcelain live_signals.csv)" ]; then
+            git config user.name "signal-bot"
+            git config user.email "signal-bot@users.noreply.github.com"
+            git add live_signals.csv
+            git commit -m "Update live signal results"
+            for i in 1 2 3; do
+              git pull --rebase --autostash && git push && break
+              sleep 5
+            done
+          fi
