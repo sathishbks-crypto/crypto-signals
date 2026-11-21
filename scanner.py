@@ -3,7 +3,7 @@
 Crypto futures signal scanner (signals only - no auto trading).
 
 HOW IT PROTECTS YOU
-  * 12 rule sets (fast 15m and slow 1h entries) are tested on the last ~60 days.
+  * 6 rule sets (1h entry + 4h trend) are tested on the last ~60 days.
   * Only a rule set that made a profit in BOTH halves of that period is used live.
   * If no rule set is profitable, live signals are PAUSED (you get one notice).
   * The test repeats automatically once a day, so the choice follows the market.
@@ -71,13 +71,80 @@ _BASE = {
     "F": {"name": "Dip in strong trend", "entry": "dip", "adx": 28,
           "sl_buf": 0.8, "tp1": 0.8, "tp2": 1.6, "vol": 0.0, "max_risk_atr": 3.5},
 }
-# A-F: 15m entry + 1h trend (fast)   G-L: same ideas on 1h entry + 4h trend (slow)
+# ----------------------------------------------------------------------------
+# Your settings (settings.txt in the repo). Change numbers there, not here.
+# ----------------------------------------------------------------------------
+SETTINGS_FILE = "settings.txt"
+DEFAULT_SETTINGS = {
+    "start_balance": 100.0,       # paper balance (USDT) the counting starts from
+    "risk_per_trade": 1.0,        # % of current balance lost if a stop-loss hits
+    "daily_profit_target": "off", # % profit in a day -> no new signals that day (off = no limit)
+    "daily_loss_limit": "off",    # % loss in a day -> no new signals that day (off = no limit)
+    "max_open_trades": "off",     # trades running at the same time (off = no limit)
+    "target_rr": "2",             # 2 = one target at 1:2 risk-reward; auto = rule set's own
+    "leverage": 3.0,              # only used to show the margin needed
+}
+
+
+def load_settings():
+    cfg = dict(DEFAULT_SETTINGS)
+    if os.path.exists(SETTINGS_FILE):
+        with open(SETTINGS_FILE, encoding="utf-8") as f:
+            for line in f:
+                line = line.split("#")[0].strip()
+                if "=" not in line:
+                    continue
+                k, v = [x.strip().lower() for x in line.split("=", 1)]
+                if k not in cfg:
+                    continue
+                if k == "target_rr":
+                    cfg[k] = v.replace("1:", "")
+                    continue
+                if v in ("off", "no", "none", "0"):
+                    cfg[k] = "off"
+                    continue
+                try:
+                    cfg[k] = float(v.replace("%", "").replace("$", ""))
+                except ValueError:
+                    print(f"[settings] bad value for {k}: {v} (using {cfg[k]})")
+    for k in ("daily_profit_target", "daily_loss_limit", "max_open_trades"):
+        if cfg[k] == "off":
+            cfg[k] = float("inf")
+        else:
+            try:
+                cfg[k] = float(cfg[k])
+            except (TypeError, ValueError):
+                cfg[k] = float("inf")
+    if not isinstance(cfg["risk_per_trade"], float):
+        cfg["risk_per_trade"] = 1.0
+    # safety limits so a typo cannot blow up the account
+    cfg["risk_per_trade"] = min(max(cfg["risk_per_trade"], 0.1), 20.0)
+    if cfg["daily_loss_limit"] != float("inf"):
+        cfg["daily_loss_limit"] = max(cfg["daily_loss_limit"], cfg["risk_per_trade"])
+    if cfg["daily_profit_target"] != float("inf"):
+        cfg["daily_profit_target"] = max(cfg["daily_profit_target"], 0.5)
+    if cfg["max_open_trades"] != float("inf"):
+        cfg["max_open_trades"] = max(cfg["max_open_trades"], 1)
+    cfg["start_balance"] = max(cfg["start_balance"], 1.0)
+    cfg["leverage"] = min(max(cfg["leverage"], 1.0), 20.0)
+    try:
+        rr = float(cfg["target_rr"])
+        cfg["rr"] = rr if 0.5 <= rr <= 5 else None
+    except ValueError:
+        cfg["rr"] = None
+    return cfg
+
+
+SET = load_settings()
+RR_KEY = f"{SET['rr']:g}" if SET["rr"] else "auto"
+
+# Only slow rule sets: 1h entry + 4h trend (15m tested worse because of fees)
 VARIANTS = {}
-for _k, _v in _BASE.items():
-    VARIANTS[_k] = dict(_v, tf="15m", trend_tf="1h")
 for _k, _v in zip("GHIJKL", _BASE.values()):
     VARIANTS[_k] = dict(_v, tf="1h", trend_tf="4h", name=_v["name"] + " (slow)",
                         max_risk_pct=8.0)
+    if SET["rr"]:                               # single target at your risk:reward
+        VARIANTS[_k]["tp1"] = VARIANTS[_k]["tp2"] = SET["rr"]
 
 DEFAULT_FAVORITES = [
     "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT",
@@ -564,7 +631,7 @@ def pct(a, b):
     return (b - a) / a * 100
 
 
-def format_signal(s, group, data_mode, active):
+def format_signal(s, group, data_mode, active, acct=None):
     emoji = "🟢" if s["side"] == "LONG" else "🔴"
     e = s["entry"]
     now = datetime.now(IST).strftime("%d %b %Y, %I:%M %p IST")
@@ -575,15 +642,31 @@ def format_signal(s, group, data_mode, active):
         "",
         f"Entry: <b>{fmt_price(e)}</b>",
         f"Stop-loss: {fmt_price(s['sl'])} ({pct(e, s['sl']):+.2f}%)",
-        f"Target 1: {fmt_price(s['tp1'])} ({pct(e, s['tp1']):+.2f}%)",
-        f"Target 2: {fmt_price(s['tp2'])} ({pct(e, s['tp2']):+.2f}%)",
-        "",
-        "<b>Reasons:</b>",
     ]
+    single = abs(s["tp1"] - s["tp2"]) < 1e-12
+    if single:
+        lines.append(f"Target: {fmt_price(s['tp2'])} ({pct(e, s['tp2']):+.2f}%)  "
+                     f"[1:{s['tp2_r']:g}]")
+    else:
+        lines += [f"Target 1: {fmt_price(s['tp1'])} ({pct(e, s['tp1']):+.2f}%)",
+                  f"Target 2: {fmt_price(s['tp2'])} ({pct(e, s['tp2']):+.2f}%)"]
+    stop_pct = abs(pct(e, s["sl"]))
+    if stop_pct > 0:
+        pos = 1 / (stop_pct / 100)
+        lines += [
+            "",
+            f"<b>1:2 trade</b> — stop-loss = -100% of your trade amount, target = +200%",
+            f"Size: for every $1 you put at risk, open a ${pos:,.0f} position "
+            f"(stop {stop_pct:.2f}% away). Example: risk $10 → position ${pos * 10:,.0f}.",
+            f"Never use more than {max(1, min(20, int(70 / stop_pct)))}x leverage on this trade "
+            f"(higher = liquidation before the stop-loss).",
+        ]
+    lines += ["", "<b>Reasons:</b>"]
     lines += [f"• {x}" for x in s["reasons"]]
     lines += [
         "",
-        "<b>Plan:</b> At Target 1 book half and move stop-loss to entry. "
+        ("<b>Plan:</b> Place stop-loss and target together. " if single else
+         "<b>Plan:</b> At Target 1 book half and move stop-loss to entry. ") +
         f"If nothing is hit within {hold_hours(P['tf'])} hours, close the trade. "
         "Skip if price already moved more than 0.5% from entry.",
         "",
@@ -685,9 +768,10 @@ def hold_hours(tf):
     return BACKTEST_MAX_BARS * TF_MIN[tf] // 60
 
 
-def run_all_backtests(mkt, groups):
-    start_ms = int((time.time() - BACKTEST_DAYS * 86400) * 1000)
-    need = {tf: BACKTEST_DAYS * 1440 // m + 300 for tf, m in TF_MIN.items()}
+def gen_trades(mkt, groups, days):
+    """All test trades of every rule set over the last `days` days."""
+    start_ms = int((time.time() - days * 86400) * 1000)
+    need = {tf: days * 1440 // m + 300 for tf, m in TF_MIN.items()}
     tfs = sorted({P["tf"] for P in VARIANTS.values()} | {P["trend_tf"] for P in VARIANTS.values()})
     btc = {tf: indicators(mkt.klines("BTCUSDT", tf, need[tf]))
            for tf in {P["trend_tf"] for P in VARIANTS.values()}}
@@ -700,7 +784,7 @@ def run_all_backtests(mkt, groups):
             print(f"[bt] {sym}: data error {e}")
         time.sleep(0.05)
 
-    results = {}
+    out = {}
     for key, P in VARIANTS.items():
         trades = []
         bt = btc[P["trend_tf"]]
@@ -720,16 +804,24 @@ def run_all_backtests(mkt, groups):
                     if sig:
                         res, rr, exit_i = simulate(m15, i, sig)
                         if res != "open":
-                            trades.append((sym, sig["side"], res, rr, m15["t"][i]))
+                            # (symbol, side, result, R, entry time, exit time)
+                            trades.append((sym, sig["side"], res, rr, m15["tc"][i], m15["tc"][exit_i]))
                             busy_until = max(exit_i, i + COOLDOWN_BARS)
                         break
-        results[key] = stats(trades, start_ms)
-    return results, len(data), mkt.mode
+        out[key] = trades
+    return out, start_ms, len(data), mkt.mode
 
 
-def stats(trades, start_ms):
+def run_all_backtests(mkt, groups):
+    trades, start_ms, ncoins, mode = gen_trades(mkt, groups, BACKTEST_DAYS)
+    return {k: stats(t, start_ms) for k, t in trades.items()}, ncoins, mode
+
+
+def stats(trades, start_ms, end_ms=None):
+    end_ms = end_ms or time.time() * 1000
+    trades = [t for t in trades if start_ms <= t[4] < end_ms]
     n = len(trades)
-    mid = start_ms + (time.time() * 1000 - start_ms) / 2
+    mid = start_ms + (end_ms - start_ms) / 2
     first = [t for t in trades if t[4] < mid]
     second = [t for t in trades if t[4] >= mid]
 
@@ -764,11 +856,13 @@ def backtest_and_choose(state, announce):
     if best:
         s = results[best]
         state["active"] = {"variant": best, "win": round(s["win"], 1), "n": s["n"],
-                           "net": round(s["net"], 1), "updated": time.time()}
+                           "net": round(s["net"], 1), "updated": time.time(), "rr": RR_KEY}
     else:
-        state["active"] = {"variant": None, "updated": time.time()}
+        state["active"] = {"variant": None, "updated": time.time(), "rr": RR_KEY}
 
-    lines = [f"📊 <b>Rule-set test</b> — last {BACKTEST_DAYS} days, {ncoins} coins (Binance {mode})", ""]
+    tgt = f"one target at 1:{SET['rr']:g}" if SET["rr"] else "rule set's own targets"
+    lines = [f"📊 <b>Rule-set test</b> — last {BACKTEST_DAYS} days, {ncoins} coins (Binance {mode})",
+             f"Targets: {tgt}", ""]
     for k, s in results.items():
         mark = "✅" if k == best else ("➖" if s["net"] > 0 else "❌")
         lines.append(f"{mark} {k} {VARIANTS[k]['name']} [{VARIANTS[k]['tf']}]: {s['n']} trades, win {s['win']:.0f}%, "
@@ -793,7 +887,7 @@ def backtest_and_choose(state, announce):
 # Live signal log + result tracking + monthly report
 # ----------------------------------------------------------------------------
 LOG_FIELDS = ["id", "time_ist", "symbol", "side", "entry", "sl", "tp1", "tp2",
-              "tp1_r", "tp2_r", "risk", "rule", "tf", "group", "candle_ms",
+              "tp1_r", "tp2_r", "risk", "rule", "tf", "group", "candle_ms", "acct_risk_pct",
               "status", "result", "r_multiple", "closed_ist"]
 RESULT_TEXT = {
     "tp2": "TARGET 2 HIT",
@@ -822,6 +916,29 @@ def write_log(rows):
             w.writerow(r)
 
 
+def account(rows=None):
+    """Paper account: compounding balance, today's result %, open trades."""
+    rows = read_log() if rows is None else rows
+    today = datetime.now(IST).strftime("%Y-%m-%d")
+    closed = sorted([r for r in rows if r.get("status") == "CLOSED" and r.get("closed_ist")],
+                    key=lambda r: r["closed_ist"])
+    bal, day_start = SET["start_balance"], None
+    for r in closed:
+        if day_start is None and r["closed_ist"] >= today:
+            day_start = bal
+        rk = float(r.get("acct_risk_pct") or SET["risk_per_trade"])
+        bal *= 1 + float(r.get("r_multiple") or 0) * rk / 100
+    if day_start is None:
+        day_start = bal
+    open_ = [r for r in rows if r.get("status") == "OPEN"]
+    return {
+        "balance": bal,
+        "today_pct": (bal / day_start - 1) * 100,
+        "open": len(open_),
+        "open_risk": sum(float(r.get("acct_risk_pct") or SET["risk_per_trade"]) for r in open_),
+    }
+
+
 def log_signal(sig, group, rule_key):
     rows = read_log()
     now = datetime.now(IST)
@@ -833,6 +950,7 @@ def log_signal(sig, group, rule_key):
         "tp1": f"{sig['tp1']:.10g}", "tp2": f"{sig['tp2']:.10g}",
         "tp1_r": sig["tp1_r"], "tp2_r": sig["tp2_r"], "risk": f"{sig['risk']:.10g}",
         "rule": rule_key, "tf": sig.get("tf", "15m"), "group": group, "candle_ms": sig["candle_time"],
+        "acct_risk_pct": SET["risk_per_trade"],
         "status": "OPEN", "result": "", "r_multiple": "", "closed_ist": "",
     })
     write_log(rows)
@@ -872,12 +990,14 @@ def update_open_signals(mkt):
             res = "tp1"
         r["status"] = "CLOSED"
         r["result"] = RESULT_TEXT.get(res, res)
+        if res == "tp2" and abs(sig["tp1"] - sig["tp2"]) < 1e-12:
+            r["result"] = "TARGET HIT"
         r["r_multiple"] = f"{rr:.2f}"
         r["closed_ist"] = datetime.fromtimestamp(k["tc"][exit_i] / 1000, IST).strftime("%Y-%m-%d %H:%M")
         changed = True
         emoji = "✅" if rr > 0 else "❌"
         telegram_send(f"{emoji} <b>Result: {r['side']} {r['symbol']}</b> (signal {r['time_ist']} IST)\n"
-                      f"{r['result']} → <b>{rp(rr)}</b> of the amount risked")
+                      f"{r['result']} → <b>{rp(rr)}</b> of the trade amount")
         time.sleep(0.05)
     if changed:
         write_log(rows)
@@ -894,11 +1014,16 @@ def month_report(year, month, title=None):
     rv = [float(r["r_multiple"] or 0) for r in closed]
     wins = [r for r in closed if float(r["r_multiple"] or 0) > 0]
     losses = [r for r in closed if float(r["r_multiple"] or 0) <= 0]
-    t2 = sum(1 for r in closed if r["result"].startswith("TARGET 2"))
+    t2 = sum(1 for r in closed if r["result"].startswith("TARGET 2") or r["result"] == "TARGET HIT")
     t1 = sum(1 for r in closed if r["result"].startswith("TARGET 1"))
     sl = sum(1 for r in closed if r["result"].startswith("STOP"))
-    to = sum(1 for r in closed if r["result"].startswith("CLOSED AFTER"))
+    to = sum(1 for r in closed if r["result"].startswith("CLOSED AT"))
     net = sum(rv)
+    month_pct = 1.0
+    for r in sorted(closed, key=lambda r: r.get("closed_ist", "")):
+        rk = float(r.get("acct_risk_pct") or SET["risk_per_trade"])
+        month_pct *= 1 + float(r["r_multiple"] or 0) * rk / 100
+    month_pct = (month_pct - 1) * 100
     win_pct = len(wins) / len(closed) * 100 if closed else 0
 
     per = {}
@@ -919,15 +1044,15 @@ def month_report(year, month, title=None):
         f"Total signals: <b>{len(rows)}</b>  (finished {len(closed)}, still open {len(open_)})",
         f"✅ Won: <b>{len(wins)}</b>   ❌ Lost: <b>{len(losses)}</b>   Win rate: <b>{win_pct:.0f}%</b>",
         "",
-        f"Target 2 hit: {t2}",
-        f"Target 1 hit (rest at entry): {t1}",
+        f"Target hit: {t2}",
+    ] + ([f"Target 1 hit (rest at entry): {t1}"] if t1 else []) + [
         f"Stop-loss hit: {sl}",
         f"Closed at time limit: {to}",
         "",
         side_line("LONG") + "\n" + side_line("SHORT"),
         "",
-        f"Total result: <b>{rp(net)}</b> of the amount risked per trade",
-        "(100% = one full stop-loss amount)",
+        f"Total result: <b>{rp(net)}</b> of one trade amount",
+        "(each loss ≈ -100%, each win = +200%; e.g. +600% = 6 times your trade amount)",
     ]
     if best:
         lines.append(f"Best coin: {best[0][0]} ({rp(best[0][1])})   "
@@ -979,7 +1104,8 @@ def run_scan():
             print("[report] error:", e)
         # 2) make sure a tested rule set is chosen
         active = state.get("active")
-        if not active or time.time() - active.get("updated", 0) > 24 * 3600:
+        if (not active or time.time() - active.get("updated", 0) > 24 * 3600
+                or active.get("rr", "auto") != RR_KEY):
             print("[scan] rule-set test is missing or older than 24h -> testing now")
             backtest_and_choose(state, announce=False)
             save_state(state)
@@ -1000,6 +1126,23 @@ def run_scan():
         return 0
 
     print(f"[scan] rule set {active['variant']} | {len(groups)} coins: {', '.join(groups)}")
+    acct = account()
+    print(f"[acct] balance {acct['balance']:.2f} today {acct['today_pct']:+.2f}% open {acct['open']}")
+    today = datetime.now(IST).strftime("%Y-%m-%d")
+    stop_reason = None
+    if acct["today_pct"] >= SET["daily_profit_target"]:
+        stop_reason = (f"🎯 <b>Daily target reached: {acct['today_pct']:+.2f}% today.</b>\n"
+                       "No new signals until tomorrow (12:00 AM IST). Open trades keep running.")
+    elif acct["today_pct"] - SET["risk_per_trade"] < -SET["daily_loss_limit"] - 1e-9:
+        stop_reason = (f"🛑 <b>Daily loss limit reached: {acct['today_pct']:+.2f}% today.</b>\n"
+                       "No new signals until tomorrow (12:00 AM IST). Open trades keep running.")
+    if stop_reason:
+        if state.get("day_stop") != today:
+            telegram_send(stop_reason + f"\nPaper balance: ${acct['balance']:,.2f}")
+            state["day_stop"] = today
+        save_state(state)
+        print("[scan] daily limit reached, no new signals today")
+        return 0
     jb = len(btc["c"]) - 1
     sent = 0
     for sym, group in groups.items():
@@ -1020,7 +1163,17 @@ def run_scan():
                 continue
             if time.time() - state["sent"].get(sym, 0) < COOLDOWN_BARS * TF_MIN[P["tf"]] * 60:
                 break
-            telegram_send(format_signal(sig, group, mkt.mode, active))
+            rk = SET["risk_per_trade"]
+            if acct["open"] >= SET["max_open_trades"]:
+                print(f"[scan] {sym}: skipped, {acct['open']} trades already open")
+                break
+            # worst case: every open trade + this one hits stop-loss
+            if acct["today_pct"] - (acct["open_risk"] + rk) < -SET["daily_loss_limit"] - 1e-9:
+                print(f"[scan] {sym}: skipped, could break today's loss limit")
+                break
+            telegram_send(format_signal(sig, group, mkt.mode, active, acct))
+            acct["open"] += 1
+            acct["open_risk"] += rk
             try:
                 log_signal(sig, group, active["variant"])
             except Exception as e:
@@ -1039,6 +1192,169 @@ def run_backtest():
     state = load_state()
     backtest_and_choose(state, announce=True)
     save_state(state)
+    return 0
+
+
+# ----------------------------------------------------------------------------
+# Account simulation: "what if auto-trade had run with my settings?"
+# ----------------------------------------------------------------------------
+SIM_DAYS = 90          # total history used
+SIM_UNSEEN_DAYS = 30   # last part kept hidden from the rule-set choice
+SIM_RISKS = [1, 2, 5, 10]   # trade sizes shown (% of balance per trade)
+
+
+def ist_day(ms):
+    return datetime.fromtimestamp(ms / 1000, IST).strftime("%Y-%m-%d")
+
+
+def simulate_account(trades, start_ms, end_ms):
+    """Replay trades in time order with balance %, max open trades and daily limits."""
+    rk, target, limit = SET["risk_per_trade"], SET["daily_profit_target"], SET["daily_loss_limit"]
+    tr = sorted([t for t in trades if start_ms <= t[4] < end_ms], key=lambda t: t[4])
+    bal = peak = SET["start_balance"]
+    max_dd = 0.0
+    open_ = []                       # (exit_ms, R, risk_amount)
+    day_start, day_pnl = {}, {}
+    taken = won = skipped = 0
+    month_start = {}
+    stop_days_target, stop_days_loss = set(), set()
+
+    def touch(day):
+        day_start.setdefault(day, bal)
+        day_pnl.setdefault(day, 0.0)
+        month_start.setdefault(day[:7], bal)
+
+    def close_until(ms):
+        nonlocal bal, peak, max_dd, won
+        open_.sort(key=lambda o: o[0])
+        while open_ and open_[0][0] <= ms:
+            ex, r, amt = open_.pop(0)
+            d = ist_day(ex)
+            touch(d)
+            pnl = amt * r
+            bal += pnl
+            day_pnl[d] += pnl
+            won += 1 if r > 0 else 0
+            peak = max(peak, bal)
+            max_dd = max(max_dd, (peak - bal) / peak * 100)
+
+    for t in tr:
+        close_until(t[4])
+        d = ist_day(t[4])
+        touch(d)
+        day_pct = day_pnl[d] / day_start[d] * 100
+        open_risk_pct = sum(o[2] for o in open_) / bal * 100 if bal > 0 else 999
+        if day_pct >= target:
+            stop_days_target.add(d); skipped += 1; continue
+        if day_pct - rk < -limit - 1e-9:
+            stop_days_loss.add(d); skipped += 1; continue
+        if len(open_) >= SET["max_open_trades"] or day_pct - (open_risk_pct + rk) < -limit - 1e-9:
+            skipped += 1; continue
+        open_.append((t[5], t[3], bal * rk / 100))
+        taken += 1
+    close_until(float("inf"))
+    for d in day_pnl:                                     # days that ended at a limit
+        p = day_pnl[d] / day_start[d] * 100
+        if p >= target:
+            stop_days_target.add(d)
+        if p - rk < -limit - 1e-9 and p < 0:
+            stop_days_loss.add(d)
+    day_pcts = [day_pnl[d] / day_start[d] * 100 for d in day_pnl]
+    months = []
+    keys = sorted(month_start)
+    for n, m in enumerate(keys):
+        end_bal = month_start[keys[n + 1]] if n + 1 < len(keys) else bal
+        months.append((m, (end_bal / month_start[m] - 1) * 100))
+    start = SET["start_balance"]
+    return {
+        "start": start, "end": bal, "growth": (bal / start - 1) * 100,
+        "taken": taken, "won": won, "skipped": skipped,
+        "win": won / taken * 100 if taken else 0.0,
+        "max_dd": max_dd,
+        "best_day": max(day_pcts) if day_pcts else 0.0,
+        "worst_day": min(day_pcts) if day_pcts else 0.0,
+        "days_target": len(stop_days_target), "days_loss": len(stop_days_loss),
+        "months": months,
+    }
+
+
+def fmt_lim(x):
+    return "off" if x == float("inf") else f"{x:g}"
+
+
+def sim_lines(title, r):
+    out = [title,
+           f"${r['start']:,.2f} → <b>${r['end']:,.2f}</b> (<b>{r['growth']:+.1f}%</b>)",
+           f"Trades taken: {r['taken']}  (won {r['won']}, {r['win']:.0f}%)  |  skipped by limits: {r['skipped']}",
+           f"Biggest drop from a high: -{r['max_dd']:.1f}%",
+           f"Best day: {r['best_day']:+.1f}%   Worst day: {r['worst_day']:+.1f}%",
+           ]
+    if SET["daily_profit_target"] != float("inf") or SET["daily_loss_limit"] != float("inf"):
+        out.append(f"Days profit limit reached: {r['days_target']}   "
+                   f"Days loss limit reached: {r['days_loss']}")
+    if r["months"]:
+        out.append("By month: " + ",  ".join(
+            f"{datetime.strptime(m, '%Y-%m').strftime('%b')} {g:+.1f}%" for m, g in r["months"]))
+    return out
+
+
+def run_account_simulation():
+    mkt = Market()
+    groups = build_watchlist(mkt)
+    all_trades, start_ms, ncoins, mode = gen_trades(mkt, groups, SIM_DAYS)
+    now_ms = int(time.time() * 1000)
+    split_ms = now_ms - SIM_UNSEEN_DAYS * 86400 * 1000
+
+    # A) honest test: pick the rule set on older data only, then trade the unseen days
+    older = {k: stats(t, start_ms, split_ms) for k, t in all_trades.items()}
+    pick_old = choose(older)
+    # B) full period with the rule set picked on all data (optimistic)
+    full = {k: stats(t, start_ms, now_ms) for k, t in all_trades.items()}
+    pick_full = choose(full)
+
+    rr = f"1:{SET['rr']:g}" if SET["rr"] else "rule set's own targets"
+    start = SET["start_balance"]
+    lines = [
+        f"💰 <b>Simulation: ${start:,.0f} start, {rr} trades</b>",
+        f"Stop-loss = -100% of the trade amount, target = +200%. "
+        f"{ncoins} coins, Binance {mode} data, fees included.",
+        "Shown for 4 trade sizes (trade amount = % of the balance at that moment):", "",
+    ]
+
+    def block(title, trades, t0, t1):
+        out = [title]
+        saved = SET["risk_per_trade"]
+        first = True
+        for rk in SIM_RISKS:
+            SET["risk_per_trade"] = rk
+            r = simulate_account(trades, t0, t1)
+            if first:
+                out.append(f"Trades: <b>{r['taken']}</b>  |  won {r['won']}, lost "
+                           f"{r['taken'] - r['won']}  |  win rate <b>{r['win']:.0f}%</b>")
+                first = False
+            out.append(f"• {rk:g}% per trade: ${start:,.0f} → <b>${r['end']:,.2f}</b> "
+                       f"({r['growth']:+.1f}%), biggest drop -{r['max_dd']:.1f}%")
+        SET["risk_per_trade"] = saved
+        return out
+
+    if pick_old:
+        lines += block(f"<b>A) Honest test — last {SIM_UNSEEN_DAYS} days</b> (strategy {pick_old} "
+                       f"chosen only from the {SIM_DAYS - SIM_UNSEEN_DAYS} days before)",
+                       all_trades[pick_old], split_ms, now_ms)
+    else:
+        lines.append(f"<b>A) Honest test — last {SIM_UNSEEN_DAYS} days:</b> no strategy was good "
+                     f"enough on the older data → the bot would not have traded.")
+    lines.append("")
+    if pick_full:
+        lines += block(f"<b>B) Full {SIM_DAYS} days</b> (strategy {pick_full}, optimistic)",
+                       all_trades[pick_full], start_ms, now_ms)
+    else:
+        lines.append(f"<b>B) Full {SIM_DAYS} days:</b> no strategy qualified.")
+    lines += ["", "\"Biggest drop\" = largest fall from a high point. Trust A more than B. "
+                  "Real trading also has slippage, so expect a bit less."]
+    msg = "\n".join(lines)
+    telegram_send(msg)
+    print(msg.replace("<b>", "").replace("</b>", ""))
     return 0
 
 
@@ -1061,4 +1377,6 @@ if __name__ == "__main__":
         sys.exit(run_test_message())
     if mode == "report":
         sys.exit(run_report())
+    if mode == "simulate":
+        sys.exit(run_account_simulation())
     sys.exit(run_scan())
