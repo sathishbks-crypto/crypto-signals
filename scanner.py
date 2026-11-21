@@ -83,6 +83,7 @@ DEFAULT_SETTINGS = {
     "max_open_trades": "off",     # trades running at the same time (off = no limit)
     "target_rr": "2",             # 2 = one target at 1:2 risk-reward; auto = rule set's own
     "leverage": 3.0,              # only used to show the margin needed
+    "exit_mode": "fixed",         # fixed = close all at target; ladder = close half, let rest run
 }
 
 
@@ -99,6 +100,9 @@ def load_settings():
                     continue
                 if k == "target_rr":
                     cfg[k] = v.replace("1:", "")
+                    continue
+                if k == "exit_mode":
+                    cfg[k] = "ladder" if v.startswith("ladder") else "fixed"
                     continue
                 if v in ("off", "no", "none", "0"):
                     cfg[k] = "off"
@@ -136,6 +140,8 @@ def load_settings():
 
 
 SET = load_settings()
+LADDER = SET["exit_mode"] == "ladder"
+LADDER_MAX_BARS = 240            # a runner may stay open up to 240 candles (10 days on 1h)
 RR_KEY = f"{SET['rr']:g}" if SET["rr"] else "auto"
 
 # Only slow rule sets: 1h entry + 4h trend (15m tested worse because of fees)
@@ -665,9 +671,13 @@ def format_signal(s, group, data_mode, active, acct=None):
     lines += [f"• {x}" for x in s["reasons"]]
     lines += [
         "",
-        ("<b>Plan:</b> Place stop-loss and target together. " if single else
+        ("<b>Plan (ladder):</b> At the target close HALF and move stop-loss to entry. "
+         "Each further +200% step: close half again and move stop-loss up one step. "
+         if LADDER else
+         "<b>Plan:</b> Place stop-loss and target together. " if single else
          "<b>Plan:</b> At Target 1 book half and move stop-loss to entry. ") +
-        f"If nothing is hit within {hold_hours(P['tf'])} hours, close the trade. "
+        (f"If the first target is not hit within {hold_hours(P['tf'])} hours, close the trade. "
+         if not LADDER else "") +
         "Skip if price already moved more than 0.5% from entry.",
         "",
         f"Rule set: {P['name']} — last {BACKTEST_DAYS} days test: "
@@ -764,6 +774,36 @@ def simulate(m15, i, sig):
     return "timeout", rm - fee_r, end
 
 
+def simulate_ladder(m, i, sig, max_bars=None):
+    """Close half at every +2R step, move stop to the previous step, let the rest run.
+    Returns (R result, exit index, steps reached, closed_for_real)."""
+    max_bars = max_bars or LADDER_MAX_BARS
+    d, e, risk = sig["d"], sig["entry"], sig["risk"]
+    step = sig.get("tp2_r", 2.0) or 2.0
+    fee_r = (FEE_PCT_ROUND_TRIP / 100 * e) / risk
+    size, locked, n = 1.0, 0.0, 0
+    stop = e - d * risk
+    nxt = e + d * risk * step
+    end = min(len(m["c"]) - 1, i + max_bars)
+    if end <= i:
+        return 0.0, i, 0, False
+    for k in range(i + 1, end + 1):
+        hi, lo = m["h"][k], m["l"][k]
+        if (lo <= stop) if d == 1 else (hi >= stop):          # stop first (worst case)
+            return locked + size * d * (stop - e) / risk - fee_r, k, n, True
+        while (hi >= nxt) if d == 1 else (lo <= nxt):
+            n += 1
+            locked += size / 2 * step * n                     # close half at this step
+            size /= 2
+            stop = e + d * risk * step * (n - 1)              # stop to previous step
+            nxt = e + d * risk * step * (n + 1)
+            if size < 1 / 32:                                  # tiny rest: close it
+                return locked + size * step * n - fee_r, k, n, True
+    rm = d * (m["c"][end] - e) / risk
+    finished = end - i >= max_bars
+    return locked + size * rm - fee_r, end, n, finished
+
+
 def hold_hours(tf):
     return BACKTEST_MAX_BARS * TF_MIN[tf] // 60
 
@@ -805,15 +845,26 @@ def gen_trades(mkt, groups, days):
                         res, rr, exit_i = simulate(m15, i, sig)
                         if res != "open":
                             # (symbol, side, result, R, entry time, exit time)
-                            trades.append((sym, sig["side"], res, rr, m15["tc"][i], m15["tc"][exit_i]))
+                            lr, lx, ln, _ = simulate_ladder(m15, i, sig)
+                            # (symbol, side, result, R, entry, exit, ladder R, ladder exit, steps)
+                            trades.append((sym, sig["side"], res, rr, m15["tc"][i], m15["tc"][exit_i],
+                                           lr, m15["tc"][lx], ln))
                             busy_until = max(exit_i, i + COOLDOWN_BARS)
                         break
         out[key] = trades
     return out, start_ms, len(data), mkt.mode
 
 
+def as_ladder(trades):
+    """Same trades, but with the ladder exit result."""
+    return [(t[0], t[1], "tp2" if t[6] > 0 else "loss", t[6], t[4], t[7]) + t[6:]
+            for t in trades]
+
+
 def run_all_backtests(mkt, groups):
     trades, start_ms, ncoins, mode = gen_trades(mkt, groups, BACKTEST_DAYS)
+    if LADDER:
+        trades = {k: as_ladder(v) for k, v in trades.items()}
     return {k: stats(t, start_ms) for k, t in trades.items()}, ncoins, mode
 
 
@@ -888,6 +939,7 @@ def backtest_and_choose(state, announce):
 # ----------------------------------------------------------------------------
 LOG_FIELDS = ["id", "time_ist", "symbol", "side", "entry", "sl", "tp1", "tp2",
               "tp1_r", "tp2_r", "risk", "rule", "tf", "group", "candle_ms", "acct_risk_pct",
+              "exit_mode",
               "status", "result", "r_multiple", "closed_ist"]
 RESULT_TEXT = {
     "tp2": "TARGET 2 HIT",
@@ -950,7 +1002,7 @@ def log_signal(sig, group, rule_key):
         "tp1": f"{sig['tp1']:.10g}", "tp2": f"{sig['tp2']:.10g}",
         "tp1_r": sig["tp1_r"], "tp2_r": sig["tp2_r"], "risk": f"{sig['risk']:.10g}",
         "rule": rule_key, "tf": sig.get("tf", "15m"), "group": group, "candle_ms": sig["candle_time"],
-        "acct_risk_pct": SET["risk_per_trade"],
+        "acct_risk_pct": SET["risk_per_trade"], "exit_mode": SET["exit_mode"],
         "status": "OPEN", "result": "", "r_multiple": "", "closed_ist": "",
     })
     write_log(rows)
@@ -977,6 +1029,24 @@ def update_open_signals(mkt):
             print(f"[track] {r.get('symbol')}: {e}")
             continue
         if len(k["c"]) < 2:
+            continue
+        if r.get("exit_mode") == "ladder":
+            try:
+                k = mkt.klines_from(r["symbol"], r.get("tf") or "1h", int(r["candle_ms"]),
+                                    LADDER_MAX_BARS + 5)
+            except Exception as e:
+                print(f"[track] {r.get('symbol')}: {e}")
+                continue
+            rr, exit_i, steps, done = simulate_ladder(k, 0, sig)
+            if not done:
+                continue
+            r["status"] = "CLOSED"
+            r["result"] = (f"LADDER: {steps} target step(s) hit" if steps else "STOP-LOSS HIT")
+            r["r_multiple"] = f"{rr:.2f}"
+            r["closed_ist"] = datetime.fromtimestamp(k["tc"][exit_i] / 1000, IST).strftime("%Y-%m-%d %H:%M")
+            changed = True
+            telegram_send(f"{'✅' if rr > 0 else '❌'} <b>Result: {r['side']} {r['symbol']}</b> "
+                          f"(signal {r['time_ist']} IST)\n{r['result']} → <b>{rp(rr)}</b> of the trade amount")
             continue
         res, rr, exit_i = simulate(k, 0, sig)
         finished_window = len(k["c"]) - 1 >= BACKTEST_MAX_BARS
@@ -1200,7 +1270,7 @@ def run_backtest():
 # ----------------------------------------------------------------------------
 SIM_DAYS = 90          # total history used
 SIM_UNSEEN_DAYS = 30   # last part kept hidden from the rule-set choice
-SIM_RISKS = [1, 2, 5, 10]   # trade sizes shown (% of balance per trade)
+SIM_RISKS = [1, 2]   # trade sizes shown (% of balance per trade)
 
 
 def ist_day(ms):
@@ -1218,6 +1288,7 @@ def simulate_account(trades, start_ms, end_ms):
     taken = won = skipped = 0
     month_start = {}
     stop_days_target, stop_days_loss = set(), set()
+    ruined = [False]
 
     def touch(day):
         day_start.setdefault(day, bal)
@@ -1234,12 +1305,20 @@ def simulate_account(trades, start_ms, end_ms):
             pnl = amt * r
             bal += pnl
             day_pnl[d] += pnl
+            if bal <= 0.01:                      # account wiped out
+                bal = 0.0
+                ruined[0] = True
+                open_.clear()
+                max_dd = 100.0
+                return
             won += 1 if r > 0 else 0
             peak = max(peak, bal)
             max_dd = max(max_dd, (peak - bal) / peak * 100)
 
     for t in tr:
         close_until(t[4])
+        if ruined[0]:
+            break
         d = ist_day(t[4])
         touch(d)
         day_pct = day_pnl[d] / day_start[d] * 100
@@ -1274,7 +1353,7 @@ def simulate_account(trades, start_ms, end_ms):
         "best_day": max(day_pcts) if day_pcts else 0.0,
         "worst_day": min(day_pcts) if day_pcts else 0.0,
         "days_target": len(stop_days_target), "days_loss": len(stop_days_loss),
-        "months": months,
+        "months": months, "ruined": ruined[0],
     }
 
 
@@ -1318,23 +1397,46 @@ def run_account_simulation():
         f"💰 <b>Simulation: ${start:,.0f} start, {rr} trades</b>",
         f"Stop-loss = -100% of the trade amount, target = +200%. "
         f"{ncoins} coins, Binance {mode} data, fees included.",
-        "Shown for 4 trade sizes (trade amount = % of the balance at that moment):", "",
+        f"Daily loss limit: {fmt_lim(SET['daily_loss_limit'] / SET['risk_per_trade'])} losing trades, "
+        f"max open trades: {fmt_lim(SET['max_open_trades'])}. Trade amount = % of the balance at that moment.", "",
     ]
 
     def block(title, trades, t0, t1):
         out = [title]
+        lad = [t for t in as_ladder(trades) if t0 <= t[4] < t1]
+        if lad:
+            big = max(t[6] for t in lad)
+            runners = sum(1 for t in lad if t[8] >= 2)
+            out.append(f"Ladder mode: {runners} trades reached +400% or more, "
+                       f"best single trade {rp(big)}")
+        for label, tl in (("Fixed 1:2 (close all at +200%)", trades),
+                          ("Ladder (half at each +200% step)", as_ladder(trades))):
+            out.append(f"<i>{label}</i>")
+            out += block_sizes(tl, t0, t1)
+        return out
+
+    def block_sizes(trades, t0, t1):
+        out = []
         saved = SET["risk_per_trade"]
+        saved_lim = SET["daily_loss_limit"]
         first = True
         for rk in SIM_RISKS:
             SET["risk_per_trade"] = rk
+            # keep the daily loss limit as the same number of losing trades
+            SET["daily_loss_limit"] = saved_lim * rk / saved if saved_lim != float("inf") else saved_lim
             r = simulate_account(trades, t0, t1)
             if first:
                 out.append(f"Trades: <b>{r['taken']}</b>  |  won {r['won']}, lost "
                            f"{r['taken'] - r['won']}  |  win rate <b>{r['win']:.0f}%</b>")
                 first = False
-            out.append(f"• {rk:g}% per trade: ${start:,.0f} → <b>${r['end']:,.2f}</b> "
-                       f"({r['growth']:+.1f}%), biggest drop -{r['max_dd']:.1f}%")
+            if r["ruined"]:
+                out.append(f"• {rk:g}% per trade: ❌ <b>account wiped out</b> (too many losing "
+                           f"trades open at the same time)")
+            else:
+                out.append(f"• {rk:g}% per trade: ${start:,.0f} → <b>${r['end']:,.2f}</b> "
+                           f"({r['growth']:+.1f}%), biggest drop -{r['max_dd']:.1f}%")
         SET["risk_per_trade"] = saved
+        SET["daily_loss_limit"] = saved_lim
         return out
 
     if pick_old:
