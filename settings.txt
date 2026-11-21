@@ -1,10 +1,19 @@
 # ============================================================
 #  YOUR TRADING SETTINGS  (change only the values)
+#  All % are of the balance at that moment.
 # ============================================================
 
-target_rr = 2              # 1:2  -> stop-loss = -100% of the trade amount,
-                           #         target    = +200% of the trade amount
+target_rr = 2              # 1:2 -> stop-loss = -100% of the trade amount,
+                           #        target    = +200% of the trade amount
 
-daily_profit_target = off  # off = no daily profit limit
-daily_loss_limit = off     # off = no daily loss limit
-max_open_trades = off      # off = no limit on trades at the same time
+risk_per_trade = 1         # trade amount = 1% of balance (lost if stop-loss hits)
+
+max_open_trades = 5        # at most 5 trades running at the same time
+
+daily_loss_limit = 3       # day's loss reaches 3% -> no new trades that day
+
+daily_profit_target = off  # off = no profit cap, let winning days run
+
+exit_mode = fixed          # fixed  = close the whole trade at +200%
+                           # ladder = at +200% close half, stop-loss to entry,
+                           #          let the rest run (half again at every +200% step)
