@@ -1,0 +1,10 @@
+# ============================================================
+#  YOUR TRADING SETTINGS  (change only the values)
+# ============================================================
+
+target_rr = 2              # 1:2  -> stop-loss = -100% of the trade amount,
+                           #         target    = +200% of the trade amount
+
+daily_profit_target = off  # off = no daily profit limit
+daily_loss_limit = off     # off = no daily loss limit
+max_open_trades = off      # off = no limit on trades at the same time
