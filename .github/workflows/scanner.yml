@@ -2,12 +2,12 @@ name: Signal Scanner
 
 on:
   schedule:
-    # 2 minutes after every 15-minute candle closes (times are UTC)
-    - cron: "2,17,32,47 * * * *"
+    # 3 minutes after every 1-hour candle closes
+    - cron: "3 * * * *"
   workflow_dispatch:
     inputs:
       mode:
-        description: "scan = normal | backtest = test rule sets | report = this month's results | test = test message"
+        description: "scan = normal | backtest = test rule sets | simulate = auto-trade test with your settings | report = this month | test = test message"
         required: true
         default: "scan"
         type: choice
@@ -15,6 +15,7 @@ on:
           - scan
           - backtest
           - report
+          - simulate
           - test
 
 permissions:
