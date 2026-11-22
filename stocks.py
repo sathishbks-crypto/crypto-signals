@@ -209,7 +209,7 @@ def evaluate(sym, d, i, idx, P):
     else:  # ema20 pullback
         if any(x is None for x in e20[i - 3:i]):
             return None
-        touched = any(l[k] <= e20[k] * 1.005 for k in range(i - 3, i + 1))
+        touched = any(l[k] <= e20[k] + 0.005 * abs(e20[k]) for k in range(i - 3, i + 1))
         if not (touched and c[i] > e20[i] and c[i] > h[i - 1] and hist[i] > hist[i - 1]):
             return None
         reasons.append("Pulled back to the 20-day average and bounced above yesterday's high")
@@ -217,7 +217,7 @@ def evaluate(sym, d, i, idx, P):
     risk = max(c[i] - swing, 1.0 * a)
     if risk > 3.5 * a:
         return None
-    risk_pct = risk / c[i] * 100
+    risk_pct = risk / abs(c[i]) * 100
     if risk_pct < 2 or risk_pct > 12:
         return None
     return {"symbol": sym, "close": c[i], "sl": c[i] - risk, "risk": risk,
@@ -234,7 +234,7 @@ def simulate_trade(d, i, sig):
         return None                                    # gapped below stop: skip
     risk = entry - sl
     tp = entry + RR * risk
-    cost_r = COST_PCT / 100 * entry / risk
+    cost_r = COST_PCT / 100 * abs(entry) / risk
     end = min(len(d["c"]) - 1, i + HOLD_DAYS)
     for k in range(i + 1, end + 1):
         o, hi, lo = d["o"][k], d["h"][k], d["l"][k]
@@ -251,9 +251,9 @@ def simulate_trade(d, i, sig):
     return (d["c"][end] - entry) / risk - cost_r, end, "time"
 
 
-def gen_trades(idx, data, start_day):
+def gen_trades(idx, data, start_day, variants=None):
     out = {}
-    for key, P in VARIANTS.items():
+    for key, P in (variants or VARIANTS).items():
         trades = []
         for sym, d in data.items():
             busy = -1
@@ -269,7 +269,7 @@ def gen_trades(idx, data, start_day):
                 rr, k, what = res
                 entry = d["o"][i + 1]
                 trades.append({"sym": sym, "r": rr, "in": d["day"][i + 1], "out": d["day"][k],
-                               "res": what, "stop_pct": (entry - sig["sl"]) / entry * 100})
+                               "res": what, "stop_pct": (entry - sig["sl"]) / abs(entry) * 100})
                 busy = k
         out[key] = trades
     return out
@@ -301,8 +301,9 @@ def choose(res):
     return good[0][0]
 
 
-def simulate_account(trades, a, b, risk_pct):
-    """Replay trades with capital %, max 5 positions, max 20% per stock, no leverage."""
+def simulate_account(trades, a, b, risk_pct, max_share=None, max_exposure=1.0):
+    """Replay trades with capital %, max 5 positions, max share per stock, exposure limit."""
+    max_share = MAX_POSITION_SHARE if max_share is None else max_share
     tr = sorted([x for x in trades if a <= x["in"] < b], key=lambda x: (x["in"], x["sym"]))
     cap = peak = START_CAPITAL
     dd = 0.0
@@ -319,10 +320,10 @@ def simulate_account(trades, a, b, risk_pct):
             continue
         risk_amt = cap * risk_pct / 100
         pos = risk_amt / (t["stop_pct"] / 100)
-        if pos > cap * MAX_POSITION_SHARE:             # cap position size, risk shrinks
-            pos = cap * MAX_POSITION_SHARE
+        if pos > cap * max_share:                      # cap position size, risk shrinks
+            pos = cap * max_share
             risk_amt = pos * t["stop_pct"] / 100
-        if sum(o[3] for o in open_) + pos > cap:
+        if sum(o[3] for o in open_) + pos > cap * max_exposure:
             continue
         open_.append((t["out"], t["r"], risk_amt, pos))
         taken += 1
@@ -609,6 +610,87 @@ def run_simulate():
     return 0
 
 
+# ----------------------------------------------------------------------------
+# TEST ONLY: stock futures, both directions (BUY in uptrends, SELL in downtrends)
+# ----------------------------------------------------------------------------
+FUT_COST_PCT = 0.10        # futures round-trip cost incl. slippage
+FUT_MAX_SHARE = 1.0        # one position up to 1x capital (notional)
+FUT_MAX_EXPOSURE = 3.0     # all positions together up to 3x capital (margin)
+
+
+def mirror(d):
+    """Price series turned upside down: a SHORT on d == a LONG on mirror(d)."""
+    neg = lambda xs: [None if x is None else -x for x in xs]
+    m = dict(d)
+    m["o"], m["c"] = neg(d["o"]), neg(d["c"])
+    m["h"], m["l"] = neg(d["l"]), neg(d["h"])
+    for k in ("ema20", "ema50", "ema200", "hist"):
+        m[k] = neg(d[k])
+    m["rsi"] = [None if x is None else 100 - x for x in d["rsi"]]
+    m.pop("ok", None)
+    return m
+
+
+def run_futures_test():
+    global COST_PCT
+    idx, data = load_all("5y")
+    a_all, b = window(BT_YEARS)
+    a_old, split = window(BT_YEARS, 1)
+    _, now_b = window(0)
+    saved = COST_PCT
+    COST_PCT = FUT_COST_PCT
+    try:
+        longs = gen_trades(idx, data, a_all)
+        shorts = gen_trades(mirror(idx), {s: mirror(d) for s, d in data.items()}, a_all)
+    finally:
+        COST_PCT = saved
+    both = {k: longs[k] + shorts[k] for k in VARIANTS}
+
+    full = {k: stats(t, a_all, b) for k, t in both.items()}
+    old = {k: stats(t, a_old, split) for k, t in both.items()}
+    pick_full, pick_old = choose(full), choose(old)
+
+    lines = [f"🧪 <b>TEST: Stock FUTURES, both directions</b> — {len(data)} stocks, {BT_YEARS} years",
+             "BUY in uptrends, SELL (short) in downtrends, target 1:2, max 20 days, costs included", ""]
+    for k, s in full.items():
+        sl = stats(shorts[k], a_all, b)
+        mark = "✅" if k == pick_full else ("➖" if s["net"] > 0 else "❌")
+        lines.append(f"{mark} {k} {VARIANTS[k]['name']}: {s['n']} trades ({sl['n']} short), win {s['win']:.0f}%, "
+                     f"total {s['net'] * 100:+.0f}% (halves {s['net1'] * 100:+.0f}% / {s['net2'] * 100:+.0f}%)")
+    lines.append("")
+
+    def block(title, key, a, bb):
+        out = [title]
+        t = [x for x in both[key] if a <= x["in"] < bb]
+        nshort = sum(1 for x in shorts[key] if a <= x["in"] < bb)
+        for rk in SIM_RISKS:
+            r = simulate_account(both[key], a, bb, rk, FUT_MAX_SHARE, FUT_MAX_EXPOSURE)
+            if rk == SIM_RISKS[0]:
+                out.append(f"Trades taken: <b>{r['taken']}</b> | won {r['won']} | win rate "
+                           f"<b>{(r['won'] / r['taken'] * 100) if r['taken'] else 0:.0f}%</b> "
+                           f"(signals {len(t)}, of which {nshort} short)")
+            out.append(f"• {rk}% risk per trade: ₹{START_CAPITAL:,} → <b>{rs(r['end'])}</b> "
+                       f"({r['growth']:+.1f}%), biggest drop -{r['dd']:.1f}%")
+        return out
+
+    if pick_old:
+        lines += block(f"<b>A) Honest test — last 12 months</b> (rule {pick_old}, chosen from the 2 years before)",
+                       pick_old, split, now_b)
+    else:
+        lines.append("<b>A) Honest test — last 12 months:</b> no rule set qualified on the older data.")
+    lines.append("")
+    if pick_full:
+        lines += block(f"<b>B) Full {BT_YEARS} years</b> (rule {pick_full}, optimistic)", pick_full, a_all, b)
+    else:
+        lines.append(f"<b>B) Full {BT_YEARS} years:</b> no rule set qualified.")
+    lines += ["", "TEST ONLY — no signals are sent from this. Real stock futures need big lots "
+                  "(one lot usually needs about ₹1–3 lakh margin). Past results do not guarantee future results."]
+    msg = "\n".join(lines)
+    tg(msg)
+    print(msg)
+    return 0
+
+
 def run_report():
     now = datetime.now(IST)
     tg(month_report(now.strftime("%Y-%m"), f"📅 <b>Stock report so far — {now.strftime('%B %Y')}</b>"))
@@ -621,5 +703,5 @@ if __name__ == "__main__":
         ok = tg("✅ India Stocks bot connected. Stock signals will arrive here (separate from crypto).")
         print("sent" if ok else "not sent")
         sys.exit(0)
-    sys.exit({"backtest": run_backtest, "simulate": run_simulate,
+    sys.exit({"backtest": run_backtest, "simulate": run_simulate, "futures": run_futures_test,
               "report": run_report}.get(mode, run_scan)())
