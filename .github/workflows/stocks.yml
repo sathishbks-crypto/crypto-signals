@@ -1,0 +1,75 @@
+name: India Stock Signals
+
+on:
+  schedule:
+    # 4:20 PM IST, Monday-Friday (after NSE close). Times are UTC.
+    - cron: "50 10 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "scan = daily | backtest = test rule sets | simulate = Rs.1 lakh what-if | report = this month | test = test message"
+        required: true
+        default: "scan"
+        type: choice
+        options:
+          - scan
+          - backtest
+          - simulate
+          - report
+          - test
+
+permissions:
+  contents: write
+
+concurrency:
+  group: stock-scanner
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Load stock bot memory
+        uses: actions/cache/restore@v4
+        with:
+          path: stocks_state.json
+          key: stocks-state-${{ github.run_id }}
+          restore-keys: |
+            stocks-state-
+
+      - name: Run stock scanner
+        env:
+          STOCKS_BOT_TOKEN: ${{ secrets.STOCKS_BOT_TOKEN }}
+          STOCKS_CHAT_ID: ${{ secrets.STOCKS_CHAT_ID || secrets.TELEGRAM_CHAT_ID || secrets.CHAT_ID || secrets.TG_CHAT_ID }}
+          MODE: ${{ github.event.inputs.mode || 'scan' }}
+        run: python stocks.py "$MODE"
+
+      - name: Save stock bot memory
+        if: always()
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: stocks_state.json
+          key: stocks-state-${{ github.run_id }}
+
+      - name: Save stock results file to the repo
+        if: always()
+        continue-on-error: true
+        run: |
+          if [ -f stocks_signals.csv ] && [ -n "$(git status --porcelain stocks_signals.csv)" ]; then
+            git config user.name "signal-bot"
+            git config user.email "signal-bot@users.noreply.github.com"
+            git add stocks_signals.csv
+            git commit -m "Update stock signal results"
+            for i in 1 2 3; do
+              git pull --rebase --autostash && git push && break
+              sleep 5
+            done
+          fi
