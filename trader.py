@@ -13,6 +13,7 @@ Commands (run from the bot folder):
   python3 trader.py monitor   -> check open trades, record results (every 5 min)
   python3 trader.py status    -> send balance + open trades to Telegram
   python3 trader.py check     -> test the API keys (no trading)
+  python3 trader.py simulate  -> "what if this bot ran for the last 90 days" report
 
 Pause new trades:   touch PAUSE      Resume:   rm PAUSE
 Secrets are read from secrets.txt (created by setup.sh).
@@ -576,6 +577,9 @@ def main():
             monitor(bn, st)
         elif cmd == "status":
             status(bn, st)
+        elif cmd == "simulate":
+            log("running 90-day simulation with futures data (takes a few minutes)...")
+            S.run_account_simulation()
         else:
             ensure_one_way(bn)
             scan(bn, st)
