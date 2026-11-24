@@ -23,6 +23,7 @@ Run on the server (bot folder):   python3 intraday_test.py
 The report is sent to Telegram (takes about 5-8 minutes).
 """
 
+import gc
 import json
 import os
 import sys
@@ -43,6 +44,7 @@ START = 100000.0
 ENTRY_BAR = "09:15"     # 1-hour candle 9:15-10:15 -> decision at about 10 AM, entry by 10:15
 LAST_BAR = "13:15"      # candle 13:15-14:15 -> trade closed at about 2 PM
 TEST_DAYS = 365
+FETCH_DAYS = 430        # a little more than a year, for the 20-day average (keeps memory low)
 LIST_FILE = "stocks_list.txt"
 
 SECRETS = {}
@@ -85,14 +87,15 @@ def http_json(url, tries=3):
 
 
 def hourly(sym):
-    """1-hour candles (about 2 years, so indicators are ready), grouped by day."""
+    """1-hour candles (about 14 months, so indicators are ready), grouped by day."""
     ys = sym if sym.startswith("^") else sym + ".NS"
     q = urllib.parse.quote(ys)
     err = None
     for host in ("query1", "query2"):
         try:
             j = http_json(f"https://{host}.finance.yahoo.com/v8/finance/chart/{q}"
-                          f"?range=2y&interval=60m&includePrePost=false")
+                          f"?period1={int(time.time()) - FETCH_DAYS * 86400}&period2={int(time.time())}"
+                          f"&interval=60m&includePrePost=false")
             res = j["chart"]["result"][0]
             break
         except Exception as e:
@@ -107,7 +110,8 @@ def hourly(sym):
         if None in (o, h, l, c) or c <= 0:
             continue
         d = datetime.fromtimestamp(t, IST)
-        days.setdefault(d.strftime("%Y-%m-%d"), []).append((d.strftime("%H:%M"), o, h, l, c, v or 0))
+        days.setdefault(sys.intern(d.strftime("%Y-%m-%d")), []).append(
+            (sys.intern(d.strftime("%H:%M")), round(o, 2), round(h, 2), round(l, 2), round(c, 2), int(v or 0)))
     for d in days:
         days[d].sort()
     return days
@@ -231,7 +235,7 @@ def account(trades):
 def main():
     t0 = time.time()
     syms = load_list()
-    print(f"Downloading 2 years of 1-hour candles for {len(syms)} stocks + Nifty (about 5-8 minutes)...",
+    print(f"Downloading 14 months of 1-hour candles for {len(syms)} stocks + Nifty (about 5-8 minutes)...",
           flush=True)
     try:
         nifty = hourly("^NSEI")
@@ -245,6 +249,7 @@ def main():
         except Exception as e:
             print(f"  {s}: skipped ({e})")
         if n % 40 == 0:
+            gc.collect()
             print(f"  {n}/{len(syms)} done", flush=True)
         time.sleep(0.3)
     if not data:
