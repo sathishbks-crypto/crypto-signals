@@ -3,10 +3,13 @@
 TEST ONLY - places no trade.
 
 Idea (BUY only, never SELL):
-  The daily candle opens at 5:30 AM India time (00:00 UTC). Take that open price.
-  Every time the price reaches another +1% above it (+1%, +2%, +3% ...),
-  open a new LONG at that level (each level once per day, several trades can
-  be open together).
+  The daily candle opens at 5:30 AM India time (00:00 UTC). Start from that open price.
+  Every time the price rises +1% from its LOWEST point since the last trade
+  (at the start: since the open), open a new LONG. After each trade the count
+  starts again from that entry price. So:
+     rises 1%, 2%, 3% above the open  -> a trade at each step
+     falls, then bounces 1% from the new low -> another trade
+  No limit on the number of trades per day; several can be open together.
   Each trade: $10, 5x leverage.
      stop-loss = 5% of the trade amount  -> price 1% below the entry
      target    = 10% of the trade amount -> price 2% above the entry   (1:2)
@@ -95,17 +98,21 @@ def run_day(bars, day_start, day_end):
         return [], None
     open_px = day_bars[0][1]
     trades = []
-    next_k = 1
+    low = open_px                       # lowest price since the last trade (start: the open)
     for i, b in enumerate(bars):
         if b[0] >= day_end:
             break
         if b[0] < day_start:
             continue
-        # new levels reached in this candle
-        while b[2] >= open_px * (1 + next_k * STEP / 100):
-            lvl = open_px * (1 + next_k * STEP / 100)
-            trades.append({"k": next_k, "entry": lvl, "t": b[0], "i": i, "res": None})
-            next_k += 1
+        took = False
+        # every +1% from the low reached in this candle = one more BUY
+        while b[2] >= low * (1 + STEP / 100):
+            lvl = low * (1 + STEP / 100)
+            trades.append({"k": len(trades) + 1, "entry": lvl, "low": low, "t": b[0], "i": i, "res": None})
+            low = lvl                   # count again from this entry
+            took = True
+        if not took:
+            low = min(low, b[3])        # follow the price down
     for t in trades:
         tp, sl = t["entry"] * (1 + TP_PRICE / 100), t["entry"] * (1 - SL_PRICE / 100)
         for b in bars[t["i"] + 1:]:
@@ -145,8 +152,9 @@ def main():
         tg(f"🔬 {sym}: no data.")
         return 1
 
-    header = [f"🔬 <b>{sym} +1% ladder test — BUY only</b>",
-              f"From the 5:30 AM open, a new LONG at every +{STEP:g}% (once per level per day). "
+    header = [f"🔬 <b>{sym} +1% bounce/ladder test — BUY only</b>",
+              f"From the 5:30 AM open: a new LONG every time the price rises +{STEP:g}% from its lowest point "
+              f"since the last trade (also after a fall). No limit per day. "
               f"${AMOUNT:g} each, {LEV}x. Stop-loss 5% (price -{SL_PRICE:g}%), target 10% (price +{TP_PRICE:g}%). "
               f"Fees included. No SELL trades are ever taken.", ""]
     all_tr, lines = [], []
@@ -163,11 +171,11 @@ def main():
             lines.append(f"Highest today: {hi:,.2f} ({(hi / op - 1) * 100:+.2f}%)")
             lines.append("")
             if not tr:
-                lines.append("Price never went +1% above the open → <b>no trade today</b>.")
+                lines.append("Price never rose +1% from any low → <b>no trade today</b>.")
             for t in tr:
                 mark = {"target": "✅ target", "stop": "❌ stop-loss", "open": "⏳ still open"}[t["res"]]
                 extra = f" at {fmt_t(t['out_t'])}" if "out_t" in t else f" ({t['open_pnl']:+.1f}% now)"
-                lines.append(f"Level +{t['k']}% · entry {t['entry']:,.2f} at {fmt_t(t['t'])} → {mark}{extra} "
+                lines.append(f"#{t['k']} · up {STEP:g}% from {t['low']:,.2f} → entry {t['entry']:,.2f} at {fmt_t(t['t'])} → {mark}{extra} "
                              f"· {pnl(t):+.2f} $")
         else:
             net = sum(pnl(t) for t in tr)
