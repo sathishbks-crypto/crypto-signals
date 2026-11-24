@@ -29,10 +29,14 @@ Run on the server (bot folder):
     nohup python3 ladder_40.py > ladder.log 2>&1 &
     (optional)  python3 ladder_40.py 30      -> last 30 days only
 Takes about 20-30 minutes. The report goes to Telegram.
+Each finished coin is saved, so if the run stops (Killed), just run the same
+command again: it skips the coins already done and continues.
 Progress:   tail -3 ladder.log
 """
 
 import gc
+import heapq
+import os
 import sys
 import time
 from array import array
@@ -40,6 +44,8 @@ from datetime import datetime
 
 import scanner as S
 import btc_levels as B          # tg(), get(), IST
+
+HERE = os.path.dirname(os.path.abspath(__file__))
 
 DAYS = int(sys.argv[1]) if len(sys.argv) > 1 else 90
 STEPS = (1.0, 0.5, 0.25)
@@ -69,14 +75,14 @@ def klines_1m(sym, start_ms, end_ms):
 
 
 def ladder(T, O, H, L, C, step, side, out):
-    """Find all trades of one coin. Appends (entry_ms, exit_ms, pnl $) to out (3 arrays)."""
+    """Find all trades of one coin. Appends entry_ms, exit_ms, pnl $ (3 numbers per trade) to out."""
     n = len(T)
     sl_p, tp_p = step, 2 * step
     win = AMOUNT * (tp_p * LEV - FEE) / 100
     loss = AMOUNT * (-sl_p * LEV - FEE) / 100
     day = None
     ref = 0.0
-    entries = []                 # (index, entry price)
+    ent_i, ent_p = array("l"), array("d")      # index, entry price (small memory)
     up, dn = 1 + step / 100, 1 - step / 100
     for i in range(n):
         d = int(T[i]) // DAY_MS
@@ -86,7 +92,7 @@ def ladder(T, O, H, L, C, step, side, out):
             took = False
             while H[i] >= ref * up:
                 ref *= up
-                entries.append((i, ref))
+                ent_i.append(i); ent_p.append(ref)
                 took = True
             if not took and L[i] < ref:
                 ref = L[i]
@@ -94,12 +100,12 @@ def ladder(T, O, H, L, C, step, side, out):
             took = False
             while L[i] <= ref * dn:
                 ref *= dn
-                entries.append((i, ref))
+                ent_i.append(i); ent_p.append(ref)
                 took = True
             if not took and H[i] > ref:
                 ref = H[i]
     last = C[n - 1]
-    for i, e in entries:
+    for i, e in zip(ent_i, ent_p):
         tp = e * (1 + side * tp_p / 100)
         sl = e * (1 - side * sl_p / 100)
         res_t, res = INF, None
@@ -117,21 +123,32 @@ def ladder(T, O, H, L, C, step, side, out):
                     res_t, res = T[j], win; break
         if res is None:          # still open: value at the latest price
             res = AMOUNT * (side * (last / e - 1) * 100 * LEV - FEE) / 100
-        out[0].append(T[i]); out[1].append(res_t); out[2].append(res)
-    return len(entries)
+        out.append(T[i]); out.append(res_t); out.append(res)
+    return len(ent_i)
 
 
-def wallet(cand, win_amt, loss_amt):
-    """Run the $100 wallet over all signals in time order."""
-    en, ex, pn = cand
-    order = sorted(range(len(en)), key=en.__getitem__)
+def load(path):
+    arr = array("d")
+    with open(path, "rb") as f:
+        arr.frombytes(f.read())
+    return arr
+
+
+def triples(arr):
+    for k in range(0, len(arr), 3):
+        yield arr[k], arr[k + 1], arr[k + 2]
+
+
+def wallet(files):
+    """Run the $100 wallet over all coins' signals in time order (merged file by file, low memory)."""
+    arrs = [load(f) for f in files]
+    n_sig = sum(len(a) // 3 for a in arrs)
     bal = peak = START_BAL
     dd = 0.0
     open_ = []                   # (exit_ms, pnl)
     taken = skipped = w = l = still = 0
     months = {}
-    for k in order:
-        t = en[k]
+    for t, x_t, p_v in heapq.merge(*(triples(a) for a in arrs), key=lambda z: z[0]):
         if open_:
             keep = []
             for o in open_:
@@ -148,10 +165,10 @@ def wallet(cand, win_amt, loss_amt):
             skipped += 1
             continue
         taken += 1
-        open_.append((ex[k], pn[k]))
-        if ex[k] == INF:
+        open_.append((x_t, p_v))
+        if x_t == INF:
             still += 1
-        elif pn[k] > 0:
+        elif p_v > 0:
             w += 1
         else:
             l += 1
@@ -161,7 +178,9 @@ def wallet(cand, win_amt, loss_amt):
         months[sorted(months)[-1]] = bal
     peak = max(peak, bal)
     dd = max(dd, (peak - bal) / peak * 100 if peak > 0 else 100)
-    return {"bal": bal, "dd": dd, "taken": taken, "skipped": skipped, "w": w, "l": l,
+    del arrs
+    gc.collect()
+    return {"sig": n_sig, "bal": bal, "dd": dd, "taken": taken, "skipped": skipped, "w": w, "l": l,
             "open": still, "unreal": unreal, "months": months}
 
 
@@ -172,9 +191,15 @@ def main():
     end_ms = int(time.time() * 1000) // 60_000 * 60_000
     start_ms = (end_ms // DAY_MS - DAYS + 1) * DAY_MS          # a 5:30 AM IST day start
     print(f"Testing {len(syms)} coins, last {DAYS} days, 1-minute candles (about 20-30 minutes)...", flush=True)
-    cands = {(s, d): (array("d"), array("d"), array("d")) for s in STEPS for d in (1, -1)}
+    cache = os.path.join(HERE, f"ladder_cache_{DAYS}d_{datetime.now(B.IST).strftime('%Y%m%d')}")
+    os.makedirs(cache, exist_ok=True)
+    fname = lambda sym, st, side: os.path.join(cache, f"{sym}_{st:g}_{'buy' if side == 1 else 'sell'}.bin")
     done = []
     for k, sym in enumerate(syms, 1):
+        if os.path.exists(os.path.join(cache, sym + ".done")):      # finished in an earlier run
+            done.append(sym)
+            print(f"  {k}/{len(syms)} {sym} already done (saved)", flush=True)
+            continue
         try:
             T, O, H, L, C = klines_1m(sym, start_ms, end_ms)
         except Exception as e:
@@ -185,7 +210,12 @@ def main():
             continue
         for st in STEPS:
             for side in (1, -1):
-                ladder(T, O, H, L, C, st, side, cands[(st, side)])
+                out = array("d")
+                ladder(T, O, H, L, C, st, side, out)
+                with open(fname(sym, st, side), "wb") as f:
+                    f.write(out.tobytes())
+                del out
+        open(os.path.join(cache, sym + ".done"), "w").close()
         done.append(sym)
         del T, O, H, L, C
         gc.collect()
@@ -202,11 +232,10 @@ def main():
         lines.append(f"━━ <b>Step {st:g}%</b> — stop-loss {st * LEV:g}% / target {2 * st * LEV:g}% of the $10 "
                      f"(win +${win_amt:.2f}, loss ${loss_amt:.2f})")
         for side, name in ((1, "📈 BUY only"), (-1, "📉 SELL only")):
-            c = cands[(st, side)]
-            r = wallet(c, win_amt, loss_amt)
+            r = wallet([fname(sym, st, side) for sym in done])
             closed = r["w"] + r["l"]
             wr = r["w"] / closed * 100 if closed else 0
-            lines.append(f"{name}: signals {len(c[0]):,} · taken {r['taken']:,} · skipped {r['skipped']:,}")
+            lines.append(f"{name}: signals {r['sig']:,} · taken {r['taken']:,} · skipped {r['skipped']:,}")
             lines.append(f"   ✅ {r['w']:,}  ❌ {r['l']:,}  ⏳ {r['open']}  · win {wr:.0f}%")
             lines.append(f"   💰 <b>$100 → ${r['bal']:,.2f}</b> ({(r['bal'] / START_BAL - 1) * 100:+.1f}%) "
                          f"· biggest drop -{r['dd']:.0f}%")
