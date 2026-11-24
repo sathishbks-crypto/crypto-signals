@@ -94,7 +94,7 @@ def main():
             print(f"  {k}/{len(syms)} coins done", flush=True)
 
     # wallet: $10 per full $100, only with free money, profits/losses when a trade closes
-    cands.sort()
+    cands.sort(key=lambda c: (c[0], c[4]))
     bal = peak = 100.0
     dd = 0.0
     open_ = []          # (exit_ms or None, amount, result%, how, ...)
