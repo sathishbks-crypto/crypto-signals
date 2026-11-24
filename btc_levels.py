@@ -19,6 +19,8 @@ Run on the server (bot folder):
     python3 btc_levels.py                  today, BTCUSDT
     python3 btc_levels.py BTCUSDT 30       each of the last 30 days + total
     python3 btc_levels.py ETHUSDT          today, ETH
+    python3 btc_levels.py BTCUSDT 30 0.5   same with a 0.5% step:
+                                           BUY on +0.5%, stop -0.5% (2.5%), target +1% (5%)
 The report goes to Telegram.
 """
 
@@ -35,9 +37,9 @@ os.chdir(HERE)
 IST = timezone(timedelta(hours=5, minutes=30))
 BASE = "https://fapi.binance.com"
 
-STEP = 1.0          # % between levels
-SL_PRICE = 1.0      # % price  (= 5% of the amount at 5x)
-TP_PRICE = 2.0      # % price  (= 10% of the amount at 5x)
+STEP = float(sys.argv[3]) if len(sys.argv) > 3 else 1.0   # % rise that triggers a BUY
+SL_PRICE = STEP     # % price below the entry  (1% -> 5% of the amount at 5x)
+TP_PRICE = 2 * STEP # % price above the entry  (2% -> 10% of the amount at 5x)  1:2
 LEV = 5
 AMOUNT = 10.0       # $ per trade
 FEE = 0.10 * LEV    # % of the amount, round trip
@@ -105,7 +107,7 @@ def run_day(bars, day_start, day_end):
         if b[0] < day_start:
             continue
         took = False
-        # every +1% from the low reached in this candle = one more BUY
+        # every +STEP% from the low reached in this candle = one more BUY
         while b[2] >= low * (1 + STEP / 100):
             lvl = low * (1 + STEP / 100)
             trades.append({"k": len(trades) + 1, "entry": lvl, "low": low, "t": b[0], "i": i, "res": None})
@@ -152,10 +154,10 @@ def main():
         tg(f"🔬 {sym}: no data.")
         return 1
 
-    header = [f"🔬 <b>{sym} +1% bounce/ladder test — BUY only</b>",
+    header = [f"🔬 <b>{sym} +{STEP:g}% bounce/ladder test — BUY only</b>",
               f"From the 5:30 AM open: a new LONG every time the price rises +{STEP:g}% from its lowest point "
               f"since the last trade (also after a fall). No limit per day. "
-              f"${AMOUNT:g} each, {LEV}x. Stop-loss 5% (price -{SL_PRICE:g}%), target 10% (price +{TP_PRICE:g}%). "
+              f"${AMOUNT:g} each, {LEV}x. Stop-loss {SL_PRICE * LEV:g}% (price -{SL_PRICE:g}%), target {TP_PRICE * LEV:g}% (price +{TP_PRICE:g}%). "
               f"Fees included. No SELL trades are ever taken.", ""]
     all_tr, lines = [], []
     for d in range(days):
@@ -171,7 +173,7 @@ def main():
             lines.append(f"Highest today: {hi:,.2f} ({(hi / op - 1) * 100:+.2f}%)")
             lines.append("")
             if not tr:
-                lines.append("Price never rose +1% from any low → <b>no trade today</b>.")
+                lines.append(f"Price never rose +{STEP:g}% from any low → <b>no trade today</b>.")
             for t in tr:
                 mark = {"target": "✅ target", "stop": "❌ stop-loss", "open": "⏳ still open"}[t["res"]]
                 extra = f" at {fmt_t(t['out_t'])}" if "out_t" in t else f" ({t['open_pnl']:+.1f}% now)"
