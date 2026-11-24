@@ -21,6 +21,9 @@ Run on the server (bot folder):
     python3 btc_levels.py ETHUSDT          today, ETH
     python3 btc_levels.py BTCUSDT 30 0.5   same with a 0.5% step:
                                            BUY on +0.5%, stop -0.5% (2.5%), target +1% (5%)
+    python3 btc_levels.py BTCUSDT 30 1 sell   OPPOSITE: SELL (short) every time the price
+                                           falls 1% from its highest point since the last trade
+                                           (stop +1% above, target -2% below). Never BUYs.
 The report goes to Telegram.
 """
 
@@ -39,7 +42,8 @@ BASE = "https://fapi.binance.com"
 
 STEP = float(sys.argv[3]) if len(sys.argv) > 3 else 1.0   # % rise that triggers a BUY
 SL_PRICE = STEP     # % price below the entry  (1% -> 5% of the amount at 5x)
-TP_PRICE = 2 * STEP # % price above the entry  (2% -> 10% of the amount at 5x)  1:2
+TP_PRICE = 2 * STEP # % price in favour        (2% -> 10% of the amount at 5x)  1:2
+SIDE = -1 if len(sys.argv) > 4 and sys.argv[4].lower().startswith("s") else 1   # 1 = BUY, -1 = SELL
 LEV = 5
 AMOUNT = 10.0       # $ per trade
 FEE = 0.10 * LEV    # % of the amount, round trip
@@ -100,33 +104,44 @@ def run_day(bars, day_start, day_end):
         return [], None
     open_px = day_bars[0][1]
     trades = []
-    low = open_px                       # lowest price since the last trade (start: the open)
+    ref = open_px     # BUY: lowest price since the last trade; SELL: highest (start: the open)
     for i, b in enumerate(bars):
         if b[0] >= day_end:
             break
         if b[0] < day_start:
             continue
         took = False
-        # every +STEP% from the low reached in this candle = one more BUY
-        while b[2] >= low * (1 + STEP / 100):
-            lvl = low * (1 + STEP / 100)
-            trades.append({"k": len(trades) + 1, "entry": lvl, "low": low, "t": b[0], "i": i, "res": None})
-            low = lvl                   # count again from this entry
-            took = True
-        if not took:
-            low = min(low, b[3])        # follow the price down
+        if SIDE == 1:
+            # every +STEP% from the low reached in this candle = one more BUY
+            while b[2] >= ref * (1 + STEP / 100):
+                lvl = ref * (1 + STEP / 100)
+                trades.append({"k": len(trades) + 1, "entry": lvl, "low": ref, "t": b[0], "i": i, "res": None})
+                ref, took = lvl, True
+            if not took:
+                ref = min(ref, b[3])            # follow the price down
+        else:
+            # every -STEP% from the high reached in this candle = one more SELL
+            while b[3] <= ref * (1 - STEP / 100):
+                lvl = ref * (1 - STEP / 100)
+                trades.append({"k": len(trades) + 1, "entry": lvl, "low": ref, "t": b[0], "i": i, "res": None})
+                ref, took = lvl, True
+            if not took:
+                ref = max(ref, b[2])            # follow the price up
     for t in trades:
-        tp, sl = t["entry"] * (1 + TP_PRICE / 100), t["entry"] * (1 - SL_PRICE / 100)
+        e = t["entry"]
+        tp, sl = e * (1 + SIDE * TP_PRICE / 100), e * (1 - SIDE * SL_PRICE / 100)
         for b in bars[t["i"] + 1:]:
-            if b[3] <= sl:                       # stop first if both in one candle (safe side)
+            hit_sl = b[3] <= sl if SIDE == 1 else b[2] >= sl
+            hit_tp = b[2] >= tp if SIDE == 1 else b[3] <= tp
+            if hit_sl:                           # stop first if both in one candle (safe side)
                 t["res"], t["out_t"] = "stop", b[0]
                 break
-            if b[2] >= tp:
+            if hit_tp:
                 t["res"], t["out_t"] = "target", b[0]
                 break
         if t["res"] is None:
             last = bars[-1][4]
-            t["res"], t["open_pnl"] = "open", (last / t["entry"] - 1) * 100 * LEV
+            t["res"], t["open_pnl"] = "open", SIDE * (last / e - 1) * 100 * LEV
     return trades, open_px
 
 
@@ -154,11 +169,18 @@ def main():
         tg(f"🔬 {sym}: no data.")
         return 1
 
-    header = [f"🔬 <b>{sym} +{STEP:g}% bounce/ladder test — BUY only</b>",
-              f"From the 5:30 AM open: a new LONG every time the price rises +{STEP:g}% from its lowest point "
-              f"since the last trade (also after a fall). No limit per day. "
-              f"${AMOUNT:g} each, {LEV}x. Stop-loss {SL_PRICE * LEV:g}% (price -{SL_PRICE:g}%), target {TP_PRICE * LEV:g}% (price +{TP_PRICE:g}%). "
-              f"Fees included. No SELL trades are ever taken.", ""]
+    if SIDE == 1:
+        header = [f"🔬 <b>{sym} +{STEP:g}% bounce/ladder test — BUY only</b>",
+                  f"From the 5:30 AM open: a new LONG every time the price rises +{STEP:g}% from its lowest point "
+                  f"since the last trade (also after a fall). No limit per day. "
+                  f"${AMOUNT:g} each, {LEV}x. Stop-loss {SL_PRICE * LEV:g}% (price -{SL_PRICE:g}%), "
+                  f"target {TP_PRICE * LEV:g}% (price +{TP_PRICE:g}%). Fees included. No SELL trades are ever taken.", ""]
+    else:
+        header = [f"🔬 <b>{sym} -{STEP:g}% drop/ladder test — SELL only</b>",
+                  f"From the 5:30 AM open: a new SHORT every time the price falls -{STEP:g}% from its highest point "
+                  f"since the last trade (also after a rise). No limit per day. "
+                  f"${AMOUNT:g} each, {LEV}x. Stop-loss {SL_PRICE * LEV:g}% (price +{SL_PRICE:g}%), "
+                  f"target {TP_PRICE * LEV:g}% (price -{TP_PRICE:g}%). Fees included. No BUY trades are ever taken.", ""]
     all_tr, lines = [], []
     for d in range(days):
         ds = start + d * 86_400_000
@@ -169,15 +191,16 @@ def main():
         if days == 1:
             lines.append(f"5:30 AM open price: <b>{op:,.2f}</b>   now: {bars[-1][4]:,.2f} "
                          f"({(bars[-1][4] / op - 1) * 100:+.2f}%)")
-            hi = max(b[2] for b in bars)
-            lines.append(f"Highest today: {hi:,.2f} ({(hi / op - 1) * 100:+.2f}%)")
+            hi, lo = max(b[2] for b in bars), min(b[3] for b in bars)
+            lines.append(f"Highest today: {hi:,.2f} ({(hi / op - 1) * 100:+.2f}%)   "
+                         f"lowest: {lo:,.2f} ({(lo / op - 1) * 100:+.2f}%)")
             lines.append("")
             if not tr:
-                lines.append(f"Price never rose +{STEP:g}% from any low → <b>no trade today</b>.")
+                lines.append(f"Price never moved {STEP:g}% → <b>no trade today</b>.")
             for t in tr:
                 mark = {"target": "✅ target", "stop": "❌ stop-loss", "open": "⏳ still open"}[t["res"]]
                 extra = f" at {fmt_t(t['out_t'])}" if "out_t" in t else f" ({t['open_pnl']:+.1f}% now)"
-                lines.append(f"#{t['k']} · up {STEP:g}% from {t['low']:,.2f} → entry {t['entry']:,.2f} at {fmt_t(t['t'])} → {mark}{extra} "
+                lines.append(f"#{t['k']} · {'up' if SIDE == 1 else 'down'} {STEP:g}% from {t['low']:,.2f} → entry {t['entry']:,.2f} at {fmt_t(t['t'])} → {mark}{extra} "
                              f"· {pnl(t):+.2f} $")
         else:
             net = sum(pnl(t) for t in tr)
