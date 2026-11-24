@@ -148,7 +148,7 @@ def main():
     now = int(time.time() * 1000)
     today0 = now // 86_400_000 * 86_400_000                 # 00:00 UTC = 5:30 AM IST
     start = today0 - (days - 1) * 86_400_000
-    interval = "1m" if days <= 3 else "5m"
+    interval = "1m"          # 1-minute candles always (small steps need them)
     bars = klines(sym, interval, start, now)
     if not bars:
         tg(f"🔬 {sym}: no data.")
