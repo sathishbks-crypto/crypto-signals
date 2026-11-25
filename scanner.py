@@ -3,8 +3,13 @@
 Crypto futures signal scanner (signals only - no auto trading).
 
 HOW IT PROTECTS YOU
-  * 6 rule sets (1h entry + 4h trend) are tested on the last ~60 days.
-  * Only a rule set that made a profit in BOTH halves of that period is used live.
+  * 6 rule sets (1h entry + 4h trend) are tested on the last ~180 days (6 months).
+  * The test uses only YOUR coin list (favorites.txt). Today's top gainers/losers
+    are NOT tested, because picking coins by today's move makes old results look
+    better than they really were.
+  * Only a rule set that made a profit in EVERY 2-month part is used live.
+  * An "honest check" also shows: chosen on the first 4 months -> result in the
+    last 2 months it never saw.
   * If no rule set is profitable, live signals are PAUSED (you get one notice).
   * The test repeats automatically once a day, so the choice follows the market.
 
@@ -43,10 +48,13 @@ MIN_QUOTE_VOLUME = 20_000_000
 COOLDOWN_BARS = 16                # no repeat signal for a coin within 16 entry candles
 MIN_RISK_PCT = 0.4
 MAX_RISK_PCT = 4.0
-BACKTEST_DAYS = 60
+BACKTEST_DAYS = 180               # 6 months of history
+BACKTEST_PARTS = 3                # split into 3 parts (2 months each); each must be in profit
+HONEST_DAYS = 60                  # honest check: last 60 days are hidden from the choice
 BACKTEST_MAX_BARS = 48            # close a trade after 48 entry candles (12h on 15m, 48h on 1h)
 TF_MIN = {"15m": 15, "1h": 60, "4h": 240}
 FEE_PCT_ROUND_TRIP = 0.10
+SLIPPAGE_PCT = 0.05               # extra cost: stop-loss/market orders fill a little worse
 MIN_TRADES_TO_TRUST = 20          # rule set needs at least this many test trades
 LOG_FILE = "live_signals.csv"     # every live signal + its real result
 
@@ -680,8 +688,8 @@ def format_signal(s, group, data_mode, active, acct=None):
          if not LADDER else "") +
         "Skip if price already moved more than 0.5% from entry.",
         "",
-        f"Rule set: {P['name']} — last {BACKTEST_DAYS} days test: "
-        f"{active['win']:.0f}% win, {active['n']} trades",
+        f"Rule set: {P['name']} — last {BACKTEST_DAYS // 30} months test: "
+        f"{active['win']:.0f}% of trades in profit, {active['n']} trades",
         f"{P['trend_tf']} trend + {P['tf']} entry  |  {now}",
     ]
     if data_mode == "spot":
@@ -746,7 +754,7 @@ def save_state(state):
 def simulate(m15, i, sig):
     d, e, sl, tp1, tp2, risk = sig["d"], sig["entry"], sig["sl"], sig["tp1"], sig["tp2"], sig["risk"]
     r1, r2 = sig["tp1_r"], sig["tp2_r"]
-    fee_r = (FEE_PCT_ROUND_TRIP / 100 * e) / risk
+    fee_r = ((FEE_PCT_ROUND_TRIP + SLIPPAGE_PCT) / 100 * e) / risk
     hit1, stop = False, sl
     end = min(len(m15["c"]) - 1, i + BACKTEST_MAX_BARS)
     if end <= i:
@@ -780,7 +788,7 @@ def simulate_ladder(m, i, sig, max_bars=None):
     max_bars = max_bars or LADDER_MAX_BARS
     d, e, risk = sig["d"], sig["entry"], sig["risk"]
     step = sig.get("tp2_r", 2.0) or 2.0
-    fee_r = (FEE_PCT_ROUND_TRIP / 100 * e) / risk
+    fee_r = ((FEE_PCT_ROUND_TRIP + SLIPPAGE_PCT) / 100 * e) / risk
     size, locked, n = 1.0, 0.0, 0
     stop = e - d * risk
     nxt = e + d * risk * step
@@ -861,29 +869,65 @@ def as_ladder(trades):
             for t in trades]
 
 
+def backtest_coins(mkt):
+    """Coins for the rule-set test: only your fixed list (favorites.txt).
+    Top gainers/losers are left out on purpose: they are chosen by TODAY's move,
+    so testing them on old data would show results that were not really possible."""
+    groups = build_watchlist(mkt)
+    return {s: g for s, g in groups.items() if g == "Your list"} or groups
+
+
 def run_all_backtests(mkt, groups):
     trades, start_ms, ncoins, mode = gen_trades(mkt, groups, BACKTEST_DAYS)
     if LADDER:
         trades = {k: as_ladder(v) for k, v in trades.items()}
-    return {k: stats(t, start_ms) for k, t in trades.items()}, ncoins, mode
+    now_ms = time.time() * 1000
+    split_ms = now_ms - HONEST_DAYS * 86400 * 1000
+    results = {k: stats(t, start_ms, now_ms) for k, t in trades.items()}
+    # honest check: choose using only the older part, then look at the hidden part
+    older = {k: stats(t, start_ms, split_ms) for k, t in trades.items()}
+    pick = choose(older)
+    honest = {"pick": pick,
+              "res": stats(trades[pick], split_ms, now_ms, parts=1) if pick else None}
+    return results, ncoins, mode, honest
 
 
-def stats(trades, start_ms, end_ms=None):
+def stats(trades, start_ms, end_ms=None, parts=None):
     end_ms = end_ms or time.time() * 1000
+    parts = parts or BACKTEST_PARTS
     trades = [t for t in trades if start_ms <= t[4] < end_ms]
     n = len(trades)
     mid = start_ms + (end_ms - start_ms) / 2
     first = [t for t in trades if t[4] < mid]
     second = [t for t in trades if t[4] >= mid]
+    step = (end_ms - start_ms) / parts
+    part_net = [sum(t[3] for t in trades
+                    if start_ms + p * step <= t[4] < start_ms + (p + 1) * step)
+                for p in range(parts)]
 
-    def win(ts):
-        return sum(1 for t in ts if t[2] in ("tp1", "tp1_end", "tp2")) / len(ts) * 100 if ts else 0.0
+    # How every trade ended (single target):
+    #   target  = target reached, stop = stop-loss hit,
+    #   time    = closed at the 48-candle time limit (can be profit OR loss)
+    tgt = [t for t in trades if t[2] in ("tp2", "tp1", "tp1_end")]
+    stp = [t for t in trades if t[2] == "loss"]
+    tim = [t for t in trades if t[2] == "timeout"]
+    prof = sum(1 for t in trades if t[3] > 0)
+
+    def avg(ts):
+        return sum(t[3] for t in ts) / len(ts) if ts else 0.0
 
     return {
-        "n": n, "win": win(trades),
+        "n": n,
+        "win": prof / n * 100 if n else 0.0,          # % of trades that ended in profit
+        "tgt_pct": len(tgt) / n * 100 if n else 0.0,  # % of trades that reached the target
+        "tgt": len(tgt), "stop": len(stp), "time": len(tim),
+        "time_win": sum(1 for t in tim if t[3] > 0),
+        "avg_tgt": avg(tgt), "avg_stop": avg(stp), "avg_time": avg(tim),
+        "avg": avg(trades),
         "tp2": (sum(1 for t in trades if t[2] == "tp2") / n * 100) if n else 0.0,
         "net": sum(t[3] for t in trades),
         "net1": sum(t[3] for t in first), "net2": sum(t[3] for t in second),
+        "parts": part_net,
         "long": sum(1 for t in trades if t[1] == "LONG"),
         "short": sum(1 for t in trades if t[1] == "SHORT"),
     }
@@ -891,17 +935,18 @@ def stats(trades, start_ms, end_ms=None):
 
 def choose(results):
     good = [(k, s) for k, s in results.items()
-            if s["n"] >= MIN_TRADES_TO_TRUST and s["net"] > 0 and s["net1"] > 0 and s["net2"] > 0]
+            if s["n"] >= MIN_TRADES_TO_TRUST and s["net"] > 0 and all(p > 0 for p in s["parts"])]
     if not good:
         return None
-    good.sort(key=lambda ks: (ks[1]["win"], ks[1]["net"]), reverse=True)
+    # best average result per trade (not "win %": a 1:2 trade can win less often and still earn)
+    good.sort(key=lambda ks: (ks[1]["avg"], ks[1]["net"]), reverse=True)
     return good[0][0]
 
 
 def backtest_and_choose(state, announce):
     mkt = Market()
-    groups = build_watchlist(mkt)
-    results, ncoins, mode = run_all_backtests(mkt, groups)
+    groups = backtest_coins(mkt)
+    results, ncoins, mode, honest = run_all_backtests(mkt, groups)
     best = choose(results)
     prev = (state.get("active") or {}).get("variant")
     if best:
@@ -912,21 +957,41 @@ def backtest_and_choose(state, announce):
         state["active"] = {"variant": None, "updated": time.time(), "rr": RR_KEY}
 
     tgt = f"one target at 1:{SET['rr']:g}" if SET["rr"] else "rule set's own targets"
-    lines = [f"📊 <b>Rule-set test</b> — last {BACKTEST_DAYS} days, {ncoins} coins (Binance {mode})",
-             f"Targets: {tgt}", ""]
+    months = BACKTEST_DAYS // 30
+    pm = BACKTEST_DAYS // BACKTEST_PARTS // 30
+    lines = [f"📊 <b>Rule-set test</b> — last {months} months, {ncoins} coins from your list "
+             f"(Binance {mode})",
+             f"Targets: {tgt}. Time limit: {BACKTEST_MAX_BARS} candles.", ""]
     for k, s in results.items():
         mark = "✅" if k == best else ("➖" if s["net"] > 0 else "❌")
-        lines.append(f"{mark} {k} {VARIANTS[k]['name']} [{VARIANTS[k]['tf']}]: {s['n']} trades, win {s['win']:.0f}%, "
-                     f"total {rp(s['net'])} (halves {rp(s['net1'])} / {rp(s['net2'])})")
+        lines += [
+            f"{mark} <b>{k} {VARIANTS[k]['name']}</b> [{VARIANTS[k]['tf']}]",
+            f"   {s['n']} trades | in profit {s['win']:.0f}% | total <b>{rp(s['net'])}</b> "
+            f"| per trade {rp(s['avg'])}",
+            f"   🎯 target {s['tgt']} ({rp(s['avg_tgt'])} each)  "
+            f"🛑 stop {s['stop']} ({rp(s['avg_stop'])} each)",
+            f"   ⏱ time limit {s['time']} ({s['time_win']} in profit, avg {rp(s['avg_time'])})",
+            f"   Each {pm}-month part: " + " / ".join(rp(p) for p in s["parts"]),
+        ]
+    lines.append("")
+    if honest["pick"]:
+        h = honest["res"]
+        lines.append(f"🔍 <b>Honest check:</b> chosen on the first {months - HONEST_DAYS // 30} months only "
+                     f"→ {honest['pick']}. In the last {HONEST_DAYS // 30} months (not seen): "
+                     f"{h['n']} trades, in profit {h['win']:.0f}%, total <b>{rp(h['net'])}</b>"
+                     + (" ✅" if h["net"] > 0 else " ❌"))
+    else:
+        lines.append(f"🔍 <b>Honest check:</b> on the first {months - HONEST_DAYS // 30} months no rule "
+                     f"set was good enough → would not have traded.")
     lines.append("")
     if best:
         lines.append(f"✅ <b>Live signals now use rule set {best}: {VARIANTS[best]['name']}</b>")
     else:
-        lines.append("⏸ <b>Live signals PAUSED</b> — no rule set made a profit in both halves of "
-                     "the test period. The test repeats daily and signals restart automatically.")
+        lines.append(f"⏸ <b>Live signals PAUSED</b> — no rule set made a profit in every {pm}-month "
+                     "part. The test repeats daily and signals restart automatically.")
     lines.append("% = profit/loss compared to the amount risked per trade (100% = one full stop-loss). "
-                 "Fees included. Past results do not guarantee "
-                 "future results.")
+                 "Fees and slippage included. \"In profit\" counts every trade that ended above zero, "
+                 "including time-limit exits. Past results do not guarantee future results.")
     msg = "\n".join(lines)
     print(msg.replace("<b>", "").replace("</b>", ""))
     if announce or best != prev:
@@ -1268,8 +1333,8 @@ def run_backtest():
 # ----------------------------------------------------------------------------
 # Account simulation: "what if auto-trade had run with my settings?"
 # ----------------------------------------------------------------------------
-SIM_DAYS = 90          # total history used
-SIM_UNSEEN_DAYS = 30   # last part kept hidden from the rule-set choice
+SIM_DAYS = 180         # total history used
+SIM_UNSEEN_DAYS = 60   # last part kept hidden from the rule-set choice
 SIM_RISKS = [1, 2]   # trade sizes shown (% of balance per trade)
 
 
@@ -1379,7 +1444,7 @@ def sim_lines(title, r):
 
 def run_account_simulation():
     mkt = Market()
-    groups = build_watchlist(mkt)
+    groups = backtest_coins(mkt)
     all_trades, start_ms, ncoins, mode = gen_trades(mkt, groups, SIM_DAYS)
     now_ms = int(time.time() * 1000)
     split_ms = now_ms - SIM_UNSEEN_DAYS * 86400 * 1000
