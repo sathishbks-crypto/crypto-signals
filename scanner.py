@@ -13,6 +13,9 @@ HOW IT PROTECTS YOU
   * If no rule set is profitable, live signals are PAUSED (you get one notice).
   * The test repeats automatically once a day, so the choice follows the market.
 
+Market data: Binance FUTURES only (never spot). GitHub's US servers cannot
+reach Binance Futures, so run tests on the Lightsail server.
+
 Every signal: 1h chart decides direction, 15m chart gives the entry,
 BTC must not move against the trade. English messages only.
 
@@ -171,6 +174,24 @@ STABLE_BASES = {
     "AEUR", "XUSD", "USD1", "BFUSD", "RLUSD", "EURI",
 }
 IST = timezone(timedelta(hours=5, minutes=30))
+
+
+def _load_server_secrets():
+    """On the server: read the Telegram keys from secrets.txt (made by setup.sh)."""
+    if os.environ.get("TELEGRAM_BOT_TOKEN") or not os.path.exists("secrets.txt"):
+        return
+    try:
+        with open("secrets.txt", encoding="utf-8") as f:
+            for line in f:
+                if "=" in line and not line.strip().startswith("#"):
+                    k, v = line.split("=", 1)
+                    if k.strip().upper() in ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"):
+                        os.environ.setdefault(k.strip().upper(), v.strip())
+    except Exception as e:
+        print("[secrets] could not read secrets.txt:", e)
+
+
+_load_server_secrets()
 UA = {"User-Agent": "Mozilla/5.0 (signal-scanner)"}
 FUTURES_HOSTS = ["https://fapi.binance.com", "https://fapi1.binance.com",
                  "https://fapi2.binance.com"]
@@ -222,8 +243,11 @@ class Market:
             except Exception:
                 continue
         if self.mode is None:
-            http_get(SPOT_HOST + "/api/v3/ping", retries=3)
-            self.mode, self.host = "spot", SPOT_HOST
+            # Futures data ONLY. Spot prices are never used as a replacement.
+            raise RuntimeError(
+                "Binance FUTURES data could not be reached from this computer "
+                "(GitHub's US servers are blocked by Binance Futures). "
+                "Run this on your Lightsail server instead.")
         print(f"[data] using {self.mode} data from {self.host}")
 
     def _raw(self, symbol, interval, limit, end_time=None, start_time=None):
