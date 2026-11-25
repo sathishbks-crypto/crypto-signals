@@ -30,9 +30,17 @@ lower timeframe = confirmation)
 Only information that existed at each moment is used (no peeking ahead).
 SHORT trades use the same rules on a mirrored price chart.
 
+Coins: EVERY Binance USDT coin with at least $20M traded in the last 24h
+(stablecoins and leveraged tokens left out), plus your favorites.txt.
+New coins without enough history are skipped automatically.
+
 Usage:
-  python smc_today.py          -> today (5:30 AM IST until now)
-  python smc_today.py 7        -> the last 7 days (more trades = fairer picture)
+  python smc_today.py              -> today (5:30 AM IST until now), all coins
+  python smc_today.py 7            -> the last 7 days (more trades = fairer picture)
+  python smc_today.py 7 mylist     -> only your favorites.txt coins
+
+Data: Binance FUTURES only. Run it on the Lightsail server
+(GitHub's US servers are blocked by Binance Futures).
 """
 
 import bisect
@@ -105,7 +113,7 @@ def swings(k):
 
 def known(sw, t_ms, before_idx=None):
     """Swings already known at time t_ms (optionally only those before an index)."""
-    out = sw[:bisect.bisect_right([s[0] for s in sw], t_ms)]
+    out = sw[:bisect.bisect_right(sw, (t_ms, float("inf"), float("inf")))]
     if before_idx is not None:
         out = [s for s in out if s[1] < before_idx]
     return out
@@ -278,6 +286,38 @@ def make_trade(sym, side, m, i, entry, stop, target, risk_pct, b4, st, res, r_mu
 
 
 # ---------------------------------------------------------------------------
+# Coins
+# ---------------------------------------------------------------------------
+def all_qualified_coins(mkt):
+    """Every clean USDT coin with enough volume (futures: only tradable perpetuals)."""
+    tradable = None
+    try:
+        tradable = mkt.tradable_symbols()
+    except Exception as e:
+        print("[coins] exchangeInfo failed:", e)
+    rows = []
+    for t in mkt.tickers_24h():
+        sym = t.get("symbol", "")
+        if not S.is_clean_usdt_symbol(sym):
+            continue
+        if tradable is not None and sym not in tradable:
+            continue
+        try:
+            vol = float(t["quoteVolume"])
+        except (KeyError, ValueError, TypeError):
+            continue
+        if vol >= S.MIN_QUOTE_VOLUME:
+            rows.append((sym, vol))
+    rows.sort(key=lambda r: r[1], reverse=True)
+    coins = [r[0] for r in rows]
+    valid = {r[0] for r in rows} | {t for t in (tradable or [])}
+    for f in S.load_favorites():                      # your coins always included
+        if f not in coins and (tradable is None or f in valid):
+            coins.append(f)
+    return coins
+
+
+# ---------------------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------------------
 def main():
@@ -285,24 +325,34 @@ def main():
     days = min(max(days, 1), 30)
     now_ms = int(time.time() * 1000)
     day_start = (now_ms // DAY_MS - days + 1) * DAY_MS   # 00:00 UTC = 5:30 AM IST
-    mkt = S.Market()
-    groups = S.backtest_coins(mkt)
+    mylist = any(a.strip().lower() in ("mylist", "my", "favorites") for a in sys.argv[2:])
+    try:
+        mkt = S.Market()
+    except Exception as e:
+        msg = f"⚠️ 4H → 1H → 15m test did not run: {e}"
+        print(msg)
+        S.telegram_send(msg)
+        return 1
+    groups = list(S.backtest_coins(mkt)) if mylist else all_qualified_coins(mkt)
     print(f"[smc] {len(groups)} coins, from "
           f"{datetime.fromtimestamp(day_start / 1000, IST):%d %b %I:%M %p} IST")
     trades, failed = [], []
-    for sym in groups:
+    for n, sym in enumerate(groups, 1):
+        if n % 25 == 0:
+            print(f"[smc] {n}/{len(groups)} coins done, {len(trades)} trades so far", flush=True)
         try:
             k4 = fetch(mkt, sym, "4h", day_start - 70 * DAY_MS)
             k1 = fetch(mkt, sym, "1h", day_start - 20 * DAY_MS)
             k15 = fetch(mkt, sym, "15m", day_start - 4 * DAY_MS)
         except Exception as e:
             print(f"[smc] {sym}: data error {e}")
+            time.sleep(1)
             failed.append(sym)
             continue
         for side in (1, -1):
             trades += find_trades(sym, k4, k1, k15, side, day_start)
     trades.sort(key=lambda t: t["time"])
-    msg = report(trades, days, day_start, len(groups) - len(failed), mkt.mode)
+    msg = report(trades, days, day_start, len(groups) - len(failed), mkt.mode, mylist)
     print(msg.replace("<b>", "").replace("</b>", ""))
     # send in pieces at trade boundaries (Telegram limit ~4000 characters)
     chunk = ""
@@ -316,12 +366,13 @@ def main():
     return 0
 
 
-def report(trades, days, day_start, ncoins, mode):
+def report(trades, days, day_start, ncoins, mode, mylist=False):
     start_txt = datetime.fromtimestamp(day_start / 1000, IST).strftime("%d %b, %I:%M %p")
     now_txt = datetime.now(IST).strftime("%d %b, %I:%M %p")
     title = "today" if days == 1 else f"last {days} days"
     lines = [f"🧭 <b>4H → 1H → 15m test — {title}</b>",
-             f"{start_txt} → {now_txt} IST | {ncoins} coins from your list (Binance {mode})",
+             f"{start_txt} → {now_txt} IST | {ncoins} coins "
+             f"({'your list' if mylist else 'all with $20M+ daily volume'}, Binance {mode})",
              "Rules: 4H direction + demand/supply half, 1H sweep + break + order block, "
              "15m confirmation. Target 1:2, fees + slippage included.", ""]
     if not trades:
