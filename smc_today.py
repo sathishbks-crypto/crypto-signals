@@ -381,8 +381,10 @@ def report(trades, days, day_start, ncoins, mode, mylist=False):
         return "\n".join(lines)
     for n, t in enumerate(trades, 1):
         icon = {"target": "✅", "stop": "❌", "open": "⏳"}[t["res"]]
-        what = {"target": f"TARGET HIT at {t['exit']:%I:%M %p}",
-                "stop": f"STOP-LOSS HIT at {t['exit']:%I:%M %p}",
+        when = (f"at {t['exit']:%I:%M %p}" if t["exit"].date() == t["time"].date()
+                else f"on {t['exit']:%d %b %I:%M %p}")
+        what = {"target": f"TARGET HIT {when}",
+                "stop": f"STOP-LOSS HIT {when}",
                 "open": "STILL OPEN now"}[t["res"]]
         e = t["entry"]
         lines += [
@@ -400,7 +402,11 @@ def report(trades, days, day_start, ncoins, mode, mylist=False):
         f"Finished trades total: <b>{S.rp(sum(t['r'] for t in done))}</b> of one trade amount"
         + (f"  (open trades right now: {S.rp(sum(t['r'] for t in trades if t['res'] == 'open'))})"
            if open_ else ""),
-        "One day is too few trades to judge a method. Run with more days before trusting it.",
+        ("One day is too few trades to judge a method. Run with more days before trusting it."
+         if days == 1 else
+         f"LONG {sum(1 for t in trades if t['side'] == 'LONG')} / "
+         f"SHORT {sum(1 for t in trades if t['side'] == 'SHORT')} trades. "
+         "Fewer than ~50 trades is still a small sample."),
     ]
     return "\n".join(lines)
 
