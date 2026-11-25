@@ -1,9 +1,8 @@
 name: Signal Scanner
 
 on:
-  schedule:
-    # 3 minutes after every 1-hour candle closes
-    - cron: "3 * * * *"
+  # No hourly schedule any more: GitHub cannot reach Binance FUTURES data,
+  # and spot data is not used. The live bot runs on the Lightsail server.
   workflow_dispatch:
     inputs:
       mode:
