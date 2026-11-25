@@ -38,13 +38,16 @@ Usage:
   python smc_today.py              -> today (5:30 AM IST until now), all coins
   python smc_today.py 7            -> the last 7 days (more trades = fairer picture)
   python smc_today.py 7 mylist     -> only your favorites.txt coins
+  python smc_today.py 180          -> 6 months (up to 180 days; about 25 minutes)
 
 Data: Binance FUTURES only. Run it on the Lightsail server
 (GitHub's US servers are blocked by Binance Futures).
 """
 
 import bisect
+import collections
 import sys
+import threading
 from concurrent.futures import ThreadPoolExecutor
 import time
 from datetime import datetime, timedelta, timezone
@@ -61,6 +64,33 @@ MIN_RISK_PCT, MAX_RISK_PCT = 0.3, 5.0
 IST = S.IST
 DAY_MS = 86400 * 1000
 WORKERS = 6                      # coins downloaded at the same time
+MAX_WEIGHT_PER_MIN = 1000        # Binance allows 2400/min per server; the rest is
+                                 # left for the live bot so the server is never blocked
+
+
+class Throttle:
+    """Keeps Binance request 'weight' under MAX_WEIGHT_PER_MIN."""
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.used = collections.deque()          # (time, weight)
+
+    def wait(self, w):
+        while True:
+            with self.lock:
+                now = time.time()
+                while self.used and now - self.used[0][0] > 60:
+                    self.used.popleft()
+                if sum(x[1] for x in self.used) + w <= MAX_WEIGHT_PER_MIN:
+                    self.used.append((now, w))
+                    return
+            time.sleep(0.5)
+
+
+THROTTLE = Throttle()
+
+
+def kline_weight(limit):
+    return 1 if limit < 100 else 2 if limit < 500 else 5 if limit <= 1000 else 10
 
 
 # ---------------------------------------------------------------------------
@@ -73,6 +103,7 @@ def fetch(mkt, sym, tf, start_ms):
     page = min(1000, max(want, 10))        # small requests = light on Binance's limits
     rows, st = [], start_ms
     while True:
+        THROTTLE.wait(kline_weight(page))
         b = mkt._raw(sym, tf, page, start_time=st)
         if not b:
             break
@@ -80,7 +111,6 @@ def fetch(mkt, sym, tf, start_ms):
         if len(b) < page:
             break
         st = int(b[-1][0]) + 1
-        time.sleep(0.05)
     now = int(time.time() * 1000)
     seen, clean = set(), []
     for r in rows:
@@ -326,7 +356,7 @@ def all_qualified_coins(mkt):
 # ---------------------------------------------------------------------------
 def main():
     days = int(sys.argv[1]) if len(sys.argv) > 1 and sys.argv[1].strip().isdigit() else 1
-    days = min(max(days, 1), 30)
+    days = min(max(days, 1), 180)
     now_ms = int(time.time() * 1000)
     day_start = (now_ms // DAY_MS - days + 1) * DAY_MS   # 00:00 UTC = 5:30 AM IST
     mylist = any(a.strip().lower() in ("mylist", "my", "favorites") for a in sys.argv[2:])
@@ -353,8 +383,20 @@ def main():
 
     # download several coins at the same time (much faster), then check the rules
     t0 = time.time()
-    with ThreadPoolExecutor(max_workers=WORKERS) as pool:
-        for n, (sym, data) in enumerate(pool.map(load, groups), 1):
+    def batches():
+        # small groups so the server never holds too much data in memory at once
+        with ThreadPoolExecutor(max_workers=WORKERS) as pool:
+            for b in range(0, len(groups), WORKERS * 2):
+                yield from pool.map(load, groups[b:b + WORKERS * 2])
+
+    def est(n_candles):
+        pages = n_candles // 1000 + 1
+        return pages * kline_weight(min(1000, n_candles))
+    per_coin = est((days + 70) * 6) + est((days + 20) * 24) + est((days + 4) * 96)
+    print(f"[smc] about {len(groups) * per_coin / MAX_WEIGHT_PER_MIN:.0f} minute(s) "
+          f"to download (kept slow on purpose so the live bot is never blocked)", flush=True)
+    if True:
+        for n, (sym, data) in enumerate(batches(), 1):
             if data is None:
                 failed.append(sym)
                 continue
