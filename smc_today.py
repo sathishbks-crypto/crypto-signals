@@ -45,6 +45,7 @@ Data: Binance FUTURES only. Run it on the Lightsail server
 
 import bisect
 import sys
+from concurrent.futures import ThreadPoolExecutor
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -59,6 +60,7 @@ TOUCH_LOOKBACK_15M = 4           # zone touched within the last hour
 MIN_RISK_PCT, MAX_RISK_PCT = 0.3, 5.0
 IST = S.IST
 DAY_MS = 86400 * 1000
+WORKERS = 6                      # coins downloaded at the same time
 
 
 # ---------------------------------------------------------------------------
@@ -66,7 +68,9 @@ DAY_MS = 86400 * 1000
 # ---------------------------------------------------------------------------
 def fetch(mkt, sym, tf, start_ms):
     """Closed candles from start_ms until now."""
-    page = 1000
+    tf_ms = {"15m": 15, "1h": 60, "4h": 240}[tf] * 60000
+    want = (int(time.time() * 1000) - start_ms) // tf_ms + 2
+    page = min(1000, max(want, 10))        # small requests = light on Binance's limits
     rows, st = [], start_ms
     while True:
         b = mkt._raw(sym, tf, page, start_time=st)
@@ -337,20 +341,28 @@ def main():
     print(f"[smc] {len(groups)} coins, from "
           f"{datetime.fromtimestamp(day_start / 1000, IST):%d %b %I:%M %p} IST")
     trades, failed = [], []
-    for n, sym in enumerate(groups, 1):
-        if n % 25 == 0:
-            print(f"[smc] {n}/{len(groups)} coins done, {len(trades)} trades so far", flush=True)
+
+    def load(sym):
         try:
-            k4 = fetch(mkt, sym, "4h", day_start - 70 * DAY_MS)
-            k1 = fetch(mkt, sym, "1h", day_start - 20 * DAY_MS)
-            k15 = fetch(mkt, sym, "15m", day_start - 4 * DAY_MS)
+            return sym, (fetch(mkt, sym, "4h", day_start - 70 * DAY_MS),
+                         fetch(mkt, sym, "1h", day_start - 20 * DAY_MS),
+                         fetch(mkt, sym, "15m", day_start - 4 * DAY_MS))
         except Exception as e:
             print(f"[smc] {sym}: data error {e}")
-            time.sleep(1)
-            failed.append(sym)
-            continue
-        for side in (1, -1):
-            trades += find_trades(sym, k4, k1, k15, side, day_start)
+            return sym, None
+
+    # download several coins at the same time (much faster), then check the rules
+    t0 = time.time()
+    with ThreadPoolExecutor(max_workers=WORKERS) as pool:
+        for n, (sym, data) in enumerate(pool.map(load, groups), 1):
+            if data is None:
+                failed.append(sym)
+                continue
+            for side in (1, -1):
+                trades += find_trades(sym, *data, side, day_start)
+            if n % 50 == 0:
+                print(f"[smc] {n}/{len(groups)} coins done, {len(trades)} trades, "
+                      f"{time.time() - t0:.0f}s", flush=True)
     trades.sort(key=lambda t: t["time"])
     msg = report(trades, days, day_start, len(groups) - len(failed), mkt.mode, mylist)
     print(msg.replace("<b>", "").replace("</b>", ""))
