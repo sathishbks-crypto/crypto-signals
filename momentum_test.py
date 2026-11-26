@@ -26,11 +26,18 @@ THE RULES (your idea, written as exact rules)
   Costs:    fees + slippage 0.15% of the position, and the real Binance
             funding fees for the hours the trade was open.
 
+  Ladder step can be changed (2nd number, in %):
+            100  = close half at +100%, +200%, +300% ...      (default)
+            1000 = close half only at +1000%, then +2000% ... (big-move hunting:
+                   lose $10 or make about $100 on a $10 trade)
+
 Usage (on the server, in the bot folder):
-  python3 momentum_test.py        -> last 30 days
-  python3 momentum_test.py 90     -> last 90 days (up to 180)
+  python3 momentum_test.py              -> last 30 days, ladder every +100%
+  python3 momentum_test.py 90           -> last 90 days (up to 180)
+  python3 momentum_test.py 180 1000     -> 6 months, half closed only at +1000% steps
 """
 
+import collections
 import sys
 import time
 from datetime import datetime
@@ -48,6 +55,7 @@ TRIGGER_LO, TRIGGER_HI = 0.50, 0.60          # entry when close is +50% to +60% 
 LEVERAGE = 10.0
 STEP_MOVE = 1 / LEVERAGE                     # +10% coin move = +100% of the trade amount
 STOP_MOVE = 0.095                            # stop just before 10x liquidation
+LADDER_STEP_R = 1.0                          # 1 = +100% steps; 10 = +1000% steps (set from command)
 COST_PCT = 0.15                              # fees + slippage, % of position
 MIN_VOLUME = 5_000_000
 H_MS = 3600 * 1000
@@ -59,10 +67,23 @@ H_MS = 3600 * 1000
 def setups(sym, k, start_ms):
     o, h, l, c, t, tc = k["o"], k["h"], k["l"], k["c"], k["t"], k["tc"]
     found = []
+    dq = collections.deque()                        # rolling lowest low of the last 7 days
     for i in range(BASE_HOURS, len(c)):
+        if not dq:
+            for x in range(i - BASE_HOURS, i):
+                while dq and l[dq[-1]] >= l[x]:
+                    dq.pop()
+                dq.append(x)
+        else:
+            x = i - 1
+            while dq and l[dq[-1]] >= l[x]:
+                dq.pop()
+            dq.append(x)
+        while dq[0] < i - BASE_HOURS:
+            dq.popleft()
         if t[i] < start_ms:
             continue
-        lo_i = min(range(i - BASE_HOURS, i), key=lambda x: l[x])
+        lo_i = dq[0]
         base = l[lo_i]
         if base <= 0:
             continue
@@ -101,12 +122,14 @@ def ladder(k, s):
     stop_r = -(e - stop) / risk                     # -0.95
     rem, step, events = 1.0, 1, []
     for x in range(s["i"] + 1, len(k["c"])):
+        s["best_r"] = max(s.get("best_r", 0.0), (k["h"][x] - e) / risk)
         if k["l"][x] <= stop:                       # stop first if both in one candle
             events.append((k["tc"][x], rem, stop_r, "stop"))
             return events, 0.0, k["tc"][x], 0.0
-        while k["h"][x] >= e + step * risk:
+        while k["h"][x] >= e + step * LADDER_STEP_R * risk:
             half = rem / 2 if rem > 0.02 else rem      # last tiny piece: close it all
-            events.append((k["tc"][x], half, float(step), f"+{step * 100}%"))
+            lvl = step * LADDER_STEP_R
+            events.append((k["tc"][x], half, lvl, f"+{lvl * 100:.0f}%"))
             rem -= half
             step += 1
             if rem <= 1e-9:
@@ -129,8 +152,11 @@ def funding_rates(mkt, s, end_ms):
 
 # ---------------------------------------------------------------------------
 def main():
-    days = int(sys.argv[1]) if len(sys.argv) > 1 and sys.argv[1].isdigit() else 30
-    days = min(max(days, 1), 180)
+    global LADDER_STEP_R
+    nums = [int(a) for a in sys.argv[1:] if a.strip().isdigit()]
+    days = min(max(nums[0] if nums else 30, 1), 180)
+    if len(nums) > 1:
+        LADDER_STEP_R = min(max(nums[1], 100), 5000) / 100
     try:
         mkt = S.Market()
     except Exception as e:
@@ -228,16 +254,19 @@ def main():
 
 def report(trades, days, start_ms, ncoins, bal, open_value, max_dd):
     ist = lambda ms: datetime.fromtimestamp(ms / 1000, S.IST)
-    lines = [f"🚀 <b>Momentum LONG + ladder test — last {days} days</b>",
+    st = LADDER_STEP_R * 100
+    lines = [f"🚀 <b>Momentum LONG + ladder (+{st:.0f}% steps) — last {days} days</b>",
              f"{ist(start_ms):%d %b %I:%M %p} → {datetime.now(S.IST):%d %b %I:%M %p} IST | "
              f"{ncoins} futures coins ($5M+ daily volume)",
              "Rules: +30% from 7-day low, 1–2 corrections, entry when a 1h candle closes "
              "+50% to +60% above that low. 10x leverage: stop -100% of the trade (coin -9.5%), "
-             "close half at every +100% (every +10% coin move). One new trade per day. Start $100, "
+             f"close half at every +{st:.0f}% (every +{st / 10:.0f}% coin move). "
+             "One new trade per day. Start $100, "
              "$10 per $100 of balance. Fees, slippage and real funding included.", ""]
     if not trades:
         lines.append("No coin matched these rules in this period → no trade.")
         return "\n".join(lines)
+    short = len(trades) > 40                        # many trades -> one line each
     for n, s in enumerate(trades, 1):
         steps = [ev[3] for ev in s["events"] if ev[3] != "stop"]
         if len(steps) > 4:
@@ -250,21 +279,36 @@ def report(trades, days, start_ms, ncoins, bal, open_value, max_dd):
         else:
             end = "fully closed by the ladder"
         icon = "✅" if s["pnl"] + s.get("open_usd", 0) > 0 else "❌"
+        if short:
+            tag = ("open" if s["rem"] > 1e-9 else "stop" if stopped else "done")
+            lines.append(f"{icon} {n}. {s['sym']} {ist(s['ms']):%d %b} ${s['amount']:.0f} | "
+                         f"best +{s.get('best_r', 0) * 100:.0f}% | "
+                         f"{', '.join(steps) if steps else '-'} | {tag} | <b>{s['pnl']:+.2f}$</b>")
+            continue
         lines += [
             f"{icon} <b>{n}. LONG {s['sym']}</b> — {ist(s['ms']):%d %b %I:%M %p} | amount ${s['amount']:.0f}",
             f"Entry {S.fmt_price(s['entry'])} (+{s['gain'] * 100:.0f}% above 7-day low, "
             f"{s['corr']} correction{'s' if s['corr'] > 1 else ''}) | "
             f"Stop {S.fmt_price(s['stop'])} (coin -{STOP_MOVE * 100:.1f}% = trade -100%, 10x)",
-            f"Ladder: {', '.join(steps) if steps else 'no +100% step reached'} | {end}",
+            f"Ladder: {', '.join(steps) if steps else f'no +{st:.0f}% step reached'} | {end}"
+            f" | best move +{s.get('best_r', 0) * 100:.0f}%",
             f"→ Closed result <b>{s['pnl']:+.2f}$</b>"
             + (f" (funding {s['fund_usd']:+.2f}$)" if abs(s.get("fund_usd", 0)) >= 0.01 else ""), ""]
     wins = sum(1 for s in trades if s["pnl"] + s.get("open_usd", 0) > 0)
+    hit = sum(1 for s in trades if any(ev[3] != "stop" for ev in s["events"]))
+    reach = [(lvl, sum(1 for s in trades if s.get("best_r", 0) >= lvl / 100))
+             for lvl in (100, 300, 500, 1000, 2000)]
+    if short:
+        lines.append("")
     lines += [
         f"<b>Summary:</b> {len(trades)} trades — ✅ {wins} in profit, ❌ {len(trades) - wins} in loss",
         f"Start balance: $100.00",
         f"Balance with closed results: <b>${bal:.2f}</b> ({(bal / START_BALANCE - 1) * 100:+.1f}%)",
         f"Open trades right now: {open_value:+.2f}$ → if closed now: <b>${bal + open_value:.2f}</b>",
         f"Biggest fall from a high point: -{max_dd:.1f}%",
+        f"Trades that reached the first +{st:.0f}% step: <b>{hit} of {len(trades)}</b>",
+        "Best move after entry (before stop): "
+        + ", ".join(f"+{lvl}%: {n}" for lvl, n in reach),
         "Note: coins that crashed and were removed from Binance are missing from this test, "
         "so real results could be worse. 30 days is a short test — try 90 or 180 days too.",
     ]
