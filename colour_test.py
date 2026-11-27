@@ -308,7 +308,9 @@ def main():
         bk.open_value = 0.0
         for sym, p in bk.open.items():
             dd = 1 if p["side"] == "LONG" else -1
-            bk.open_value += p["qty"] * (last_close.get(sym, p["entry"]) - p["entry"]) * dd
+            p["now"] = last_close.get(sym, p["entry"])
+            p["open_usd"] = p["pnl"] + p["qty"] * (p["now"] - p["entry"]) * dd
+            bk.open_value += p["qty"] * (p["now"] - p["entry"]) * dd
     wait_min.sort()
     med = wait_min[len(wait_min) // 2] if wait_min else 0
     msg = report(books, days, first_day, len(data), signals, med, tf, sorted(no_spot))
@@ -365,6 +367,20 @@ def report(books, days, first_day, ncoins, signals, med_wait, tf="15m", no_spot=
             "Worst coins: " + ", ".join(f"{s[:-4]} {v:+.0f}$" for s, v in best[-3:][::-1]),
             "",
         ]
+    if days <= 3:                                      # short test: show every trade (way B)
+        bk = books["B"]
+        lines.append("<b>Every trade — B) target 2% / stop 1% of the coin price</b>")
+        allp = sorted(bk.trades + list(bk.open.values()), key=lambda p: p["ms"])
+        for n, p in enumerate(allp, 1):
+            if p in bk.trades:
+                icon = {"target": "✅", "stop": "❌"}.get(p["why"], "⏹")
+                res = (f"{p['why']} {ist(p['exit_ms']):%I:%M %p}" if p.get("exit_ms") else p["why"])
+                usd = p["pnl"]
+            else:
+                icon, res, usd = "⏳", f"open, now {S.fmt_price(p['now'])}", p["open_usd"]
+            lines.append(f"{icon} {n}. {p['side']} {p['sym'][:-4]} {ist(p['ms']):%I:%M:%S %p} @ "
+                         f"{S.fmt_price(p['entry'])} → {res} <b>{usd:+.2f}$</b>")
+        lines.append("")
     lines.append("<b>Wallet at the end of each day (A | B)</b>")
     for (day, a), (_, b) in zip(books["A"].daily, books["B"].daily):
         lines.append(f"{ist(day):%d %b}: ${a:.0f} | ${b:.0f}")
