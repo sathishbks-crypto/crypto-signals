@@ -15,8 +15,8 @@ YOUR RULE
      -0.5%..+0.5%, then the next time it reaches +/-0.5% a new trade is taken
      (same coin, as many times as it happens). The first colour change is
      needed only once, at the start of the day.
-  3) Target 0.5%, stop-loss 0.25% of the coin price  (1 : 2)
-     At 10x: target = +5% of the trade (+$5), stop = -2.5% (-$2.50).
+  3) Target 1.5%, stop-loss 0.5% of the coin price  (1 : 3)
+     At 10x: target = +15% of the trade (+$15), stop = -5% (-$5).
      Stop first if both are touched in the same second.
      Neither touched -> closed at 5:30 AM next morning (or shown "open" today).
 
@@ -28,7 +28,8 @@ YOUR RULE
 Usage (on the server, in the bot folder):
   python3 watch_test.py          -> today, from 5:30 AM IST until now, one trade per coin
   python3 watch_test.py multi    -> today, many trades per coin (re-enter after each close)
-  python3 watch_test.py 0.5 0.25 -> other trigger / target and stop (target = trigger here)
+  python3 watch_test.py multi 0.5 1.5 0.5
+                                 -> choose: trigger %, target %, stop % (here 0.5 / 1.5 / 0.5)
 """
 
 import sys
@@ -39,8 +40,8 @@ import fill_sheet as F
 import scanner as S
 
 TRIGGER = 0.005                 # % row must reach +/-0.5%
-TARGET = 0.005                  # +0.5% price
-STOP = 0.0025                   # -0.25% price
+TARGET = 0.015                  # +1.5% price
+STOP = 0.005                    # -0.5% price   (1 : 3)
 START, MARGIN, LEV = 1000.0, 100.0, 10.0
 MAX_OPEN = 10
 COST = 0.0015                   # fees + slippage, of the position
@@ -123,7 +124,9 @@ def futures_gap(mkt, sym, minute_ms, spot_price):
 def main():
     global TRIGGER, TARGET, STOP
     nums = [float(a) for a in sys.argv[1:] if a.replace(".", "", 1).isdigit()]
-    if len(nums) >= 2:
+    if len(nums) >= 3:
+        TRIGGER, TARGET, STOP = nums[0] / 100, nums[1] / 100, nums[2] / 100
+    elif len(nums) == 2:
         TRIGGER, TARGET, STOP = nums[0] / 100, nums[0] / 100, nums[1] / 100
     try:
         mkt = S.Market()
@@ -195,7 +198,7 @@ def report(status, taken, trades, bal, day, no_spot, multi=False):
              f"5:30 AM → {datetime.now(S.IST):%I:%M %p} IST. Colours from SPOT 1-second candles, "
              "trades priced on FUTURES.",
              f"Rule: after the first colour change, wait until the % row reaches +{tr:.2f}% (LONG) "
-             f"or -{tr:.2f}% (SHORT). Target +{tp:.2f}% / stop -{sl:.2f}% price (1:2) = "
+             f"or -{tr:.2f}% (SHORT). Target +{tp:.2f}% / stop -{sl:.2f}% price (1:{tp / sl:g}) = "
              f"+{tp * LEV:.1f}% / -{sl * LEV:.1f}% of a $100 trade at 10x. "
              "Fees + slippage about $1.50 per trade."
              + (" After each close the % row must come back inside ±"
@@ -224,8 +227,10 @@ def report(status, taken, trades, bal, day, no_spot, multi=False):
         + (f" | no colour change yet: {no_change}" if no_change else ""),
         f"Wallet: $1000 → <b>${bal:.2f}</b> ({(bal / START - 1) * 100:+.2f}%) with closed trades"
         + (f"; open trades now {sum(r['usd'] for r in open_):+.2f}$" if open_ else ""),
-        "Note: with $1.50 fees, a win nets about +$3.50 and a loss about -$4.00, "
-        "so more than 53% of trades must win just to break even. One day is not enough to judge.",
+        f"Note: with $1.50 fees, a win nets about +${MARGIN * LEV * TARGET - 1.5:.2f} and a loss about "
+        f"-${MARGIN * LEV * STOP + 1.5:.2f}, so more than "
+        f"{(MARGIN * LEV * STOP + 1.5) / (MARGIN * LEV * (TARGET + STOP)) * 100:.0f}% of trades must win "
+        "just to break even. One day is not enough to judge.",
     ]
     if multi and taken:
         by = {}
