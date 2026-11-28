@@ -37,8 +37,8 @@ Usage (on the server, in the bot folder):
   python3 btc_day.py 0.5 0.5 0.5     -> trigger %, target %, stop %
   python3 btc_day.py days 30         -> the last 30 days in ONE report (no Excel);
                                         the balance carries on from day to day
-  python3 btc_day.py days 30 compare -> same 30 days, 3 settings side by side
-                                        (trigger 0.5%, target/stop 0.5%, 1%, 2%; all 1:1)
+  python3 btc_day.py days 30 compare -> same 30 days, 6 settings side by side
+                                        (trigger 0.5%, target/stop 0.5, 1, 2, 3, 4, 5%; all 1:1)
   Downloaded days are saved in the folder cache_1s, so the next run is fast.
 """
 
@@ -201,7 +201,7 @@ def trades_rows(trades, summary):
 
 # ---------------------------------------------------------------------------
 CACHE_DIR = "cache_1s"
-COMPARE = [(0.5, 0.5, 0.5), (0.5, 1.0, 1.0), (0.5, 2.0, 2.0)]   # trigger, target, stop (%)
+COMPARE = [(0.5, x, x) for x in (0.5, 1.0, 2.0, 3.0, 4.0, 5.0)]   # trigger, target, stop (%)
 
 
 def load_day(m, sym, day, now_ms):
@@ -223,7 +223,11 @@ def load_day(m, sym, day, now_ms):
 
 
 class Run:
-    """Money for one setting over many days."""
+    """One setting over many days. A trade stays open across 5:30 AM until it hits
+    the target or the stop-loss (no day-end close). The average and colours still
+    start again every morning.
+    Hedge mode (like your Binance setting): one LONG and one SHORT can be open at
+    the same time. A new trade needs the % row to come back inside the band first."""
     def __init__(self, trig, tp, sl):
         self.trig, self.tp, self.sl = trig / 100, tp / 100, sl / 100
         self.bal = self.peak = START_BAL
@@ -231,45 +235,97 @@ class Run:
         self.n = self.w = self.l = 0
         self.green = self.red = 0
         self.rows = []
+        self.open = {1: None, -1: None}               # open LONG / SHORT, carried between days
+        self.last = None
+        self.longest = 0.0                            # longest trade, hours
 
-    def day(self, label, closes):
-        W.TRIGGER, W.TARGET, W.STOP = self.trig, self.tp, self.sl
-        w = W.Walker(multi=True)
-        w.feed(closes)
-        raw, _ = w.final()
-        start = self.bal
-        dw = dl = 0
-        for t in raw:
-            size = self.bal * RISK / self.sl
-            fee = size * COST
-            self.gross += size * t["move"]
-            self.fees += fee
-            self.bal += size * t["move"] - fee
-            self.peak = max(self.peak, self.bal)
-            self.max_dd = max(self.max_dd, (self.peak - self.bal) / self.peak * 100)
-            dw += t["why"] == "target"
-            dl += t["why"] == "stop"
-        self.n += len(raw)
-        self.w += dw
-        self.l += dl
+    def _close(self, side, hit, when_ms):
+        e = self.open[side]
+        move = self.tp if hit == "target" else -self.sl
+        self.gross += e["size"] * move
+        self.bal += e["size"] * move - e["size"] * COST / 2      # exit half of the fee
+        self.fees += e["size"] * COST / 2
+        self.peak = max(self.peak, self.bal)
+        self.max_dd = max(self.max_dd, (self.peak - self.bal) / self.peak * 100)
+        self.longest = max(self.longest, (when_ms - e["ms"]) / 3600000)
+        self.w += hit == "target"
+        self.l += hit == "stop"
+        self.open[side] = None
+
+    def day(self, label, closes, day_ms):
+        start, w0, l0, opened = self.bal, self.w, self.l, 0
+        total, col, changed, armed, last = 0.0, 0, None, False, None
+        for k in range(86400):
+            c = closes.get(k, last)
+            if c is None:
+                continue
+            last = c
+            total += c
+            pct = 1 - (total / (k + 1)) / c if k else 0.0
+            new = 1 if pct > 0 else -1 if pct < 0 else 0
+            just_changed = False
+            if k and changed is None:                 # colours: first change of the day
+                if new and col and new != col:
+                    changed, just_changed = k, True
+                if new:
+                    col = new
+            for side, e in self.open.items():         # open trades: target / stop
+                if e:
+                    move = (c - e["price"]) / e["price"] * side
+                    if move <= -self.sl or move >= self.tp:
+                        self._close(side, "stop" if move <= -self.sl else "target", day_ms + k * 1000)
+                        armed = False                 # must come back inside the band
+            if changed is None or k == 0:
+                continue
+            if just_changed:
+                armed = abs(pct) < self.trig
+                continue
+            if not armed:
+                armed = abs(pct) < self.trig
+                continue
+            side = 1 if pct > 0 else -1
+            if abs(pct) >= self.trig and self.open[side] is None:
+                size = self.bal * RISK / self.sl
+                self.bal -= size * COST / 2           # entry half of the fee
+                self.fees += size * COST / 2
+                self.open[side] = {"price": c, "size": size, "ms": day_ms + k * 1000}
+                self.n += 1
+                opened += 1
+                armed = False
+        self.last = last
+        dw, dl = self.w - w0, self.l - l0
         self.green += self.bal > start
         self.red += self.bal < start
         icon = "🟢" if self.bal > start else "🔴" if self.bal < start else "⚪"
-        self.rows.append(f"{icon} {label}: {len(raw)} trades (✅{dw} ❌{dl}) "
-                         f"{self.bal - start:+.2f}$ → ${self.bal:.2f}")
+        self.rows.append(f"{icon} {label}: {opened} opened, closed ✅{dw} ❌{dl} "
+                         f"{self.bal - start:+.2f}$ → ${self.bal:.2f}"
+                         + (f" (open: {' + '.join(('LONG' if sd == 1 else 'SHORT') for sd, e in self.open.items() if e)})"
+                            if any(self.open.values()) else ""))
+
+    def open_value(self, side):
+        e = self.open[side]
+        if not e or self.last is None:
+            return 0.0
+        return e["size"] * (self.last - e["price"]) / e["price"] * side
 
     def name(self):
         return f"target {self.tp * 100:g}% / stop {self.sl * 100:g}%"
 
     def summary(self):
         be = (self.sl + COST) / (self.tp + self.sl) * 100
-        return [f"Trades {self.n} — ✅ {self.w} target, ❌ {self.l} stop"
-                + (f" ({self.w / max(self.w + self.l, 1) * 100:.0f}% win; break-even about {be:.0f}%)"
-                   if self.n else ""),
-                f"Days: 🟢 {self.green} profit, 🔴 {self.red} loss",
-                f"Profit before fees: <b>${self.gross:+.2f}</b> | fees + slippage: -${self.fees:.2f}",
-                f"Balance: $1000 → <b>${self.bal:.2f}</b> ({(self.bal / START_BAL - 1) * 100:+.2f}%)",
-                f"Biggest fall from a high: -{self.max_dd:.1f}%"]
+        out = [f"Trades {self.n} — ✅ {self.w} target, ❌ {self.l} stop"
+               + (f" ({self.w / max(self.w + self.l, 1) * 100:.0f}% win; break-even about {be:.0f}%)"
+                  if self.n else ""),
+               f"Days: 🟢 {self.green} profit, 🔴 {self.red} loss",
+               f"Profit before fees: <b>${self.gross:+.2f}</b> | fees + slippage: -${self.fees:.2f}",
+               f"Balance: $1000 → <b>${self.bal:.2f}</b> ({(self.bal / START_BAL - 1) * 100:+.2f}%)",
+               f"Biggest fall from a high: -{self.max_dd:.1f}% | longest trade: {self.longest:.0f} hours"]
+        for side, e in self.open.items():
+            if e:
+                since = datetime.fromtimestamp(e["ms"] / 1000, S.IST)
+                out.append(f"Still open now: {'LONG' if side == 1 else 'SHORT'} since "
+                           f"{since:%d %b %I:%M %p}, value now {self.open_value(side):+.2f}$")
+        return out
 
 
 def main_days(sym, ndays, settings):
@@ -299,12 +355,13 @@ def main_days(sym, ndays, settings):
             print(f"[days] {ist(day):%d %b}: data error ({e})")
             continue
         for r in runs:
-            r.day(f"{ist(day):%d %b}", closes)
+            r.day(f"{ist(day):%d %b}", closes, day)
         daily.append(f"{ist(day):%d %b}: " + " | ".join(f"${r.bal:.0f}" for r in runs))
     head = [f"📘 <b>{sym[:-4]} — 1-second test, last {ndays} days "
             f"({ist(first_day):%d %b} → {ist(last_day):%d %b})</b>",
             f"Rule: after the first colour change, % row ±{runs[0].trig * 100:.2f}% → trade, "
-            "1:1 target/stop. Re-enter after each close.",
+            "1:1 target/stop. A trade is NOT closed at 5:30 AM — it runs until target or stop. "
+            "Hedge mode: one LONG and one SHORT can be open together.",
             "Money (assumed): start $1000, each trade risks 1% of the balance, the balance "
             "carries on day to day. Fees + slippage 0.15% of the position.", ""]
     if len(runs) == 1:
@@ -312,9 +369,9 @@ def main_days(sym, ndays, settings):
     else:
         lines = head
         for i, r in enumerate(runs):
-            lines += [f"<b>{'ABC'[i]}) {r.name()}</b>"] + r.summary() + [""]
+            lines += [f"<b>{'ABCDEF'[i]}) {r.name()}</b>"] + r.summary() + [""]
         lines.append("<b>Balance at the end of each day ("
-                     + " | ".join(f"{'ABC'[i]} {r.tp * 100:g}%" for i, r in enumerate(runs)) + ")</b>")
+                     + " | ".join(f"{'ABCDEF'[i]} {r.tp * 100:g}%" for i, r in enumerate(runs)) + ")</b>")
         lines += daily
     msg = "\n".join(lines)
     print(msg.replace("<b>", "").replace("</b>", ""))
@@ -382,10 +439,11 @@ def main():
         usd_move = size * t["move"]
         fee = size * COST
         usd = usd_move - fee
-        bal += usd
-        gross += usd_move
-        fees += fee
-        why = {"target": "target", "stop": "stop", "open": "closed 5:30 AM"}[t["why"]]
+        if t["why"] != "open":                        # an unfinished trade is not counted
+            bal += usd
+            gross += usd_move
+            fees += fee
+        why = {"target": "target", "stop": "stop", "open": "still open at 5:30 AM"}[t["why"]]
         wins += t["why"] == "target"
         losses += t["why"] == "stop"
         minute = (day + t["k"] * 1000) // 60000 * 60000
@@ -435,12 +493,12 @@ def main():
     for i, t in enumerate(show):
         if n > 40 and i == 15:
             lines.append(f"… {n - 25} more trades in the Excel file (sheet Trades) …")
-        icon = {"target": "✅", "stop": "❌"}.get(t["why"], "⏹")
+        icon = {"target": "✅", "stop": "❌"}.get(t["why"], "⏳")
         lines.append(f"{icon} {t['side_txt']} {t['in_txt']} @ {S.fmt_price(t['fut'])} → "
                      f"{t['why']} {t['out_txt']} <b>{t['usd']:+.2f}$</b> (bal ${t['bal']:.0f})")
     lines += ["",
               f"<b>Summary:</b> {n} trades — ✅ {wins} target, ❌ {losses} stop"
-              + (f", ⏹ {n - wins - losses} closed at 5:30 AM" if n - wins - losses else ""),
+              + (f", ⏳ {n - wins - losses} still open at 5:30 AM (not counted)" if n - wins - losses else ""),
               f"Win rate {wins / n * 100:.0f}% (break-even needs about {be:.0f}% because of fees)"
               if n else "No trade today.",
               f"Profit before fees: <b>${gross:+.2f}</b> | fees + slippage: -${fees:.2f}",
