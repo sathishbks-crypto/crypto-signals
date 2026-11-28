@@ -35,6 +35,8 @@ Usage (on the server, in the bot folder):
   python3 btc_day.py 2026-11-26      -> that day
   python3 btc_day.py ETHUSDT         -> another coin
   python3 btc_day.py 0.5 0.5 0.5     -> trigger %, target %, stop %
+  python3 btc_day.py days 30         -> the last 30 days in ONE report (no Excel);
+                                        the balance carries on from day to day
 """
 
 import os
@@ -194,14 +196,102 @@ def trades_rows(trades, summary):
 
 
 # ---------------------------------------------------------------------------
+def main_days(sym, ndays):
+    """Many days, one report, no Excel. Balance carries on day to day."""
+    try:
+        mkt = S.Market()
+    except Exception as e:
+        S.telegram_send(f"⚠️ BTC days test did not run: {e}")
+        print(e)
+        return 1
+    m = F.spot_symbol(sym)
+    if not m:
+        S.telegram_send(f"⚠️ {sym} has no spot pair (needed for 1-second candles).")
+        return 1
+    now_ms = int(time.time() * 1000)
+    last_day = (now_ms // DAY_MS - 1) * DAY_MS                    # yesterday
+    first_day = last_day - (ndays - 1) * DAY_MS
+    ist = lambda ms: datetime.fromtimestamp(ms / 1000, S.IST)
+    bal, peak, max_dd = START_BAL, START_BAL, 0.0
+    tot_n = tot_w = tot_l = 0
+    gross = fees = 0.0
+    rows = []
+    for d in range(ndays):
+        day = first_day + d * DAY_MS
+        print(f"[days] {d + 1}/{ndays} {ist(day):%d %b}: downloading…", flush=True)
+        try:
+            closes = F.spot_1s(m[0], m[1], day, 86400, now_ms)
+        except Exception as e:
+            rows.append(f"{ist(day):%d %b}: data error ({e})")
+            continue
+        w = W.Walker(multi=True)
+        w.feed(closes)
+        raw, _ = w.final()
+        start = bal
+        dw = dl = 0
+        for t in raw:
+            size = bal * RISK / W.STOP
+            fee = size * COST
+            gross += size * t["move"]
+            fees += fee
+            bal += size * t["move"] - fee
+            peak = max(peak, bal)
+            max_dd = max(max_dd, (peak - bal) / peak * 100)
+            dw += t["why"] == "target"
+            dl += t["why"] == "stop"
+        tot_n += len(raw)
+        tot_w += dw
+        tot_l += dl
+        icon = "🟢" if bal > start else "🔴" if bal < start else "⚪"
+        rows.append(f"{icon} {ist(day):%d %b}: {len(raw)} trades (✅{dw} ❌{dl}) "
+                    f"{bal - start:+.2f}$ → ${bal:.2f}")
+    tp, sl, tr = W.TARGET * 100, W.STOP * 100, W.TRIGGER * 100
+    be = (W.STOP + COST) / (W.TARGET + W.STOP) * 100
+    green = sum(1 for r in rows if r.startswith("🟢"))
+    red = sum(1 for r in rows if r.startswith("🔴"))
+    lines = [f"📘 <b>{sym[:-4]} — 1-second test, last {ndays} days "
+             f"({ist(first_day):%d %b} → {ist(last_day):%d %b})</b>",
+             f"Rule: after the first colour change, % row ±{tr:.2f}% → trade. Target {tp:.2f}% / "
+             f"stop {sl:.2f}% (1:{W.TARGET / W.STOP:g}). Re-enter after each close.",
+             "Money (assumed): start $1000, each trade risks 1% of the balance, the balance "
+             "carries on day to day. Fees + slippage 0.15% of the position.", ""]
+    lines += rows
+    lines += ["",
+              f"<b>Summary:</b> {tot_n} trades — ✅ {tot_w} target, ❌ {tot_l} stop"
+              + (f" ({tot_w / max(tot_w + tot_l, 1) * 100:.0f}% win; break-even about {be:.0f}%)"
+                 if tot_n else ""),
+              f"Days: 🟢 {green} profit, 🔴 {red} loss",
+              f"Profit before fees: <b>${gross:+.2f}</b> | fees + slippage: -${fees:.2f}",
+              f"Balance: $1000 → <b>${bal:.2f}</b> ({(bal / START_BAL - 1) * 100:+.2f}%)",
+              f"Biggest fall from a high: -{max_dd:.1f}%"]
+    msg = "\n".join(lines)
+    print(msg.replace("<b>", "").replace("</b>", ""))
+    chunk = ""
+    for line in msg.split("\n"):
+        if len(chunk) + len(line) + 1 > 3800 and chunk:
+            S.telegram_send(chunk)
+            chunk = ""
+        chunk += ("\n" if chunk else "") + line
+    if chunk:
+        S.telegram_send(chunk)
+    return 0
+
+
 def main():
     args = sys.argv[1:]
+    ndays = None
+    if "days" in [a.lower() for a in args]:
+        i = [a.lower() for a in args].index("days")
+        ndays = int(args[i + 1]) if i + 1 < len(args) and args[i + 1].isdigit() else 30
+        args = args[:i] + args[i + 2:]
     sym = next((a.upper() for a in args if a.upper().endswith("USDT")), "BTCUSDT")
     nums = [float(a) for a in args if a.replace(".", "", 1).isdigit()]
     if len(nums) >= 3:
         W.TRIGGER, W.TARGET, W.STOP = nums[0] / 100, nums[1] / 100, nums[2] / 100
     else:
         W.TRIGGER, W.TARGET, W.STOP = 0.005, 0.005, 0.005          # 1 : 1
+    if ndays:
+        return main_days(sym, min(max(ndays, 1), 60))
     now_ms = int(time.time() * 1000)
     date_arg = next((a for a in args if len(a) == 10 and a[4] == "-"), None)
     if date_arg:
