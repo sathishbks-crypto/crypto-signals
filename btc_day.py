@@ -37,8 +37,12 @@ Usage (on the server, in the bot folder):
   python3 btc_day.py 0.5 0.5 0.5     -> trigger %, target %, stop %
   python3 btc_day.py days 30         -> the last 30 days in ONE report (no Excel);
                                         the balance carries on from day to day
+  python3 btc_day.py days 30 compare -> same 30 days, 3 settings side by side
+                                        (trigger 0.5%, target/stop 0.5%, 1%, 2%; all 1:1)
+  Downloaded days are saved in the folder cache_1s, so the next run is fast.
 """
 
+import array
 import os
 import sys
 import time
@@ -196,7 +200,79 @@ def trades_rows(trades, summary):
 
 
 # ---------------------------------------------------------------------------
-def main_days(sym, ndays):
+CACHE_DIR = "cache_1s"
+COMPARE = [(0.5, 0.5, 0.5), (0.5, 1.0, 1.0), (0.5, 2.0, 2.0)]   # trigger, target, stop (%)
+
+
+def load_day(m, sym, day, now_ms):
+    """1-second closes of one day. Finished days are kept in cache_1s/ (about 0.7 MB each)."""
+    done = day + DAY_MS <= now_ms
+    path = os.path.join(CACHE_DIR, f"{sym}_{datetime.utcfromtimestamp(day / 1000):%Y-%m-%d}.bin")
+    if done and os.path.exists(path):
+        a = array.array("d")
+        with open(path, "rb") as f:
+            a.frombytes(f.read())
+        return {k: v for k, v in enumerate(a) if v == v}
+    closes = F.spot_1s(m[0], m[1], day, 86400, now_ms)
+    if done and len(closes) > 80000:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        a = array.array("d", (closes.get(k, float("nan")) for k in range(86400)))
+        with open(path, "wb") as f:
+            f.write(a.tobytes())
+    return closes
+
+
+class Run:
+    """Money for one setting over many days."""
+    def __init__(self, trig, tp, sl):
+        self.trig, self.tp, self.sl = trig / 100, tp / 100, sl / 100
+        self.bal = self.peak = START_BAL
+        self.max_dd = self.gross = self.fees = 0.0
+        self.n = self.w = self.l = 0
+        self.green = self.red = 0
+        self.rows = []
+
+    def day(self, label, closes):
+        W.TRIGGER, W.TARGET, W.STOP = self.trig, self.tp, self.sl
+        w = W.Walker(multi=True)
+        w.feed(closes)
+        raw, _ = w.final()
+        start = self.bal
+        dw = dl = 0
+        for t in raw:
+            size = self.bal * RISK / self.sl
+            fee = size * COST
+            self.gross += size * t["move"]
+            self.fees += fee
+            self.bal += size * t["move"] - fee
+            self.peak = max(self.peak, self.bal)
+            self.max_dd = max(self.max_dd, (self.peak - self.bal) / self.peak * 100)
+            dw += t["why"] == "target"
+            dl += t["why"] == "stop"
+        self.n += len(raw)
+        self.w += dw
+        self.l += dl
+        self.green += self.bal > start
+        self.red += self.bal < start
+        icon = "🟢" if self.bal > start else "🔴" if self.bal < start else "⚪"
+        self.rows.append(f"{icon} {label}: {len(raw)} trades (✅{dw} ❌{dl}) "
+                         f"{self.bal - start:+.2f}$ → ${self.bal:.2f}")
+
+    def name(self):
+        return f"target {self.tp * 100:g}% / stop {self.sl * 100:g}%"
+
+    def summary(self):
+        be = (self.sl + COST) / (self.tp + self.sl) * 100
+        return [f"Trades {self.n} — ✅ {self.w} target, ❌ {self.l} stop"
+                + (f" ({self.w / max(self.w + self.l, 1) * 100:.0f}% win; break-even about {be:.0f}%)"
+                   if self.n else ""),
+                f"Days: 🟢 {self.green} profit, 🔴 {self.red} loss",
+                f"Profit before fees: <b>${self.gross:+.2f}</b> | fees + slippage: -${self.fees:.2f}",
+                f"Balance: $1000 → <b>${self.bal:.2f}</b> ({(self.bal / START_BAL - 1) * 100:+.2f}%)",
+                f"Biggest fall from a high: -{self.max_dd:.1f}%"]
+
+
+def main_days(sym, ndays, settings):
     """Many days, one report, no Excel. Balance carries on day to day."""
     try:
         mkt = S.Market()
@@ -212,58 +288,34 @@ def main_days(sym, ndays):
     last_day = (now_ms // DAY_MS - 1) * DAY_MS                    # yesterday
     first_day = last_day - (ndays - 1) * DAY_MS
     ist = lambda ms: datetime.fromtimestamp(ms / 1000, S.IST)
-    bal, peak, max_dd = START_BAL, START_BAL, 0.0
-    tot_n = tot_w = tot_l = 0
-    gross = fees = 0.0
-    rows = []
+    runs = [Run(*st) for st in settings]
+    daily = []
     for d in range(ndays):
         day = first_day + d * DAY_MS
-        print(f"[days] {d + 1}/{ndays} {ist(day):%d %b}: downloading…", flush=True)
+        print(f"[days] {d + 1}/{ndays} {ist(day):%d %b}: loading…", flush=True)
         try:
-            closes = F.spot_1s(m[0], m[1], day, 86400, now_ms)
+            closes = load_day(m, sym, day, now_ms)
         except Exception as e:
-            rows.append(f"{ist(day):%d %b}: data error ({e})")
+            print(f"[days] {ist(day):%d %b}: data error ({e})")
             continue
-        w = W.Walker(multi=True)
-        w.feed(closes)
-        raw, _ = w.final()
-        start = bal
-        dw = dl = 0
-        for t in raw:
-            size = bal * RISK / W.STOP
-            fee = size * COST
-            gross += size * t["move"]
-            fees += fee
-            bal += size * t["move"] - fee
-            peak = max(peak, bal)
-            max_dd = max(max_dd, (peak - bal) / peak * 100)
-            dw += t["why"] == "target"
-            dl += t["why"] == "stop"
-        tot_n += len(raw)
-        tot_w += dw
-        tot_l += dl
-        icon = "🟢" if bal > start else "🔴" if bal < start else "⚪"
-        rows.append(f"{icon} {ist(day):%d %b}: {len(raw)} trades (✅{dw} ❌{dl}) "
-                    f"{bal - start:+.2f}$ → ${bal:.2f}")
-    tp, sl, tr = W.TARGET * 100, W.STOP * 100, W.TRIGGER * 100
-    be = (W.STOP + COST) / (W.TARGET + W.STOP) * 100
-    green = sum(1 for r in rows if r.startswith("🟢"))
-    red = sum(1 for r in rows if r.startswith("🔴"))
-    lines = [f"📘 <b>{sym[:-4]} — 1-second test, last {ndays} days "
-             f"({ist(first_day):%d %b} → {ist(last_day):%d %b})</b>",
-             f"Rule: after the first colour change, % row ±{tr:.2f}% → trade. Target {tp:.2f}% / "
-             f"stop {sl:.2f}% (1:{W.TARGET / W.STOP:g}). Re-enter after each close.",
-             "Money (assumed): start $1000, each trade risks 1% of the balance, the balance "
-             "carries on day to day. Fees + slippage 0.15% of the position.", ""]
-    lines += rows
-    lines += ["",
-              f"<b>Summary:</b> {tot_n} trades — ✅ {tot_w} target, ❌ {tot_l} stop"
-              + (f" ({tot_w / max(tot_w + tot_l, 1) * 100:.0f}% win; break-even about {be:.0f}%)"
-                 if tot_n else ""),
-              f"Days: 🟢 {green} profit, 🔴 {red} loss",
-              f"Profit before fees: <b>${gross:+.2f}</b> | fees + slippage: -${fees:.2f}",
-              f"Balance: $1000 → <b>${bal:.2f}</b> ({(bal / START_BAL - 1) * 100:+.2f}%)",
-              f"Biggest fall from a high: -{max_dd:.1f}%"]
+        for r in runs:
+            r.day(f"{ist(day):%d %b}", closes)
+        daily.append(f"{ist(day):%d %b}: " + " | ".join(f"${r.bal:.0f}" for r in runs))
+    head = [f"📘 <b>{sym[:-4]} — 1-second test, last {ndays} days "
+            f"({ist(first_day):%d %b} → {ist(last_day):%d %b})</b>",
+            f"Rule: after the first colour change, % row ±{runs[0].trig * 100:.2f}% → trade, "
+            "1:1 target/stop. Re-enter after each close.",
+            "Money (assumed): start $1000, each trade risks 1% of the balance, the balance "
+            "carries on day to day. Fees + slippage 0.15% of the position.", ""]
+    if len(runs) == 1:
+        lines = head + runs[0].rows + ["", "<b>Summary:</b>"] + runs[0].summary()
+    else:
+        lines = head
+        for i, r in enumerate(runs):
+            lines += [f"<b>{'ABC'[i]}) {r.name()}</b>"] + r.summary() + [""]
+        lines.append("<b>Balance at the end of each day ("
+                     + " | ".join(f"{'ABC'[i]} {r.tp * 100:g}%" for i, r in enumerate(runs)) + ")</b>")
+        lines += daily
     msg = "\n".join(lines)
     print(msg.replace("<b>", "").replace("</b>", ""))
     chunk = ""
@@ -280,6 +332,8 @@ def main_days(sym, ndays):
 def main():
     args = sys.argv[1:]
     ndays = None
+    compare = "compare" in [a.lower() for a in args]
+    args = [a for a in args if a.lower() != "compare"]
     if "days" in [a.lower() for a in args]:
         i = [a.lower() for a in args].index("days")
         ndays = int(args[i + 1]) if i + 1 < len(args) and args[i + 1].isdigit() else 30
@@ -291,7 +345,9 @@ def main():
     else:
         W.TRIGGER, W.TARGET, W.STOP = 0.005, 0.005, 0.005          # 1 : 1
     if ndays:
-        return main_days(sym, min(max(ndays, 1), 60))
+        settings = (COMPARE if compare else
+                    [(W.TRIGGER * 100, W.TARGET * 100, W.STOP * 100)])
+        return main_days(sym, min(max(ndays, 1), 60), settings)
     now_ms = int(time.time() * 1000)
     date_arg = next((a for a in args if len(a) == 10 and a[4] == "-"), None)
     if date_arg:
